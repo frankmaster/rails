@@ -1,5 +1,7 @@
-require 'abstract_unit'
-require 'active_support/concern'
+# frozen_string_literal: true
+
+require "abstract_unit"
+require "active_support/concern"
 
 class ConcernTest < ActiveSupport::TestCase
   module Baz
@@ -66,17 +68,17 @@ class ConcernTest < ActiveSupport::TestCase
   def test_module_is_included_normally
     @klass.include(Baz)
     assert_equal "baz", @klass.new.baz
-    assert @klass.included_modules.include?(ConcernTest::Baz)
+    assert_includes @klass.included_modules, ConcernTest::Baz
   end
 
   def test_class_methods_are_extended
     @klass.include(Baz)
     assert_equal "baz", @klass.baz
-    assert_equal ConcernTest::Baz::ClassMethods, (class << @klass; self.included_modules; end)[0]
+    assert_equal ConcernTest::Baz::ClassMethods, (class << @klass; included_modules; end)[0]
   end
 
   def test_class_methods_are_extended_only_on_expected_objects
-    ::Object.__send__(:include, Qux)
+    ::Object.include(Qux)
     Object.extend(Qux::ClassMethods)
     # module needs to be created after Qux is included in Object or bug won't
     # be triggered
@@ -89,7 +91,7 @@ class ConcernTest < ActiveSupport::TestCase
       end
     end
     @klass.include test_module
-    assert_equal false, Object.respond_to?(:test)
+    assert_not_respond_to Object, :test
     Qux.class_eval do
       remove_const :ClassMethods
     end
@@ -105,7 +107,7 @@ class ConcernTest < ActiveSupport::TestCase
     assert_equal "bar", @klass.new.bar
     assert_equal "bar+baz", @klass.new.baz
     assert_equal "bar's baz + baz", @klass.baz
-    assert @klass.included_modules.include?(ConcernTest::Bar)
+    assert_includes @klass.included_modules, ConcernTest::Bar
   end
 
   def test_dependencies_with_multiple_modules
@@ -123,6 +125,14 @@ class ConcernTest < ActiveSupport::TestCase
 
         included do
         end
+      end
+    end
+  end
+
+  def test_no_raise_on_same_included_call
+    assert_nothing_raised do
+      2.times do
+        load File.expand_path("../fixtures/concern/some_concern.rb", __FILE__)
       end
     end
   end

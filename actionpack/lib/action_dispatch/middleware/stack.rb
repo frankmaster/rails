@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "active_support/inflector/methods"
 require "active_support/dependencies"
 
@@ -33,6 +35,31 @@ module ActionDispatch
 
       def build(app)
         klass.new(app, *args, &block)
+      end
+
+      def build_instrumented(app)
+        InstrumentationProxy.new(build(app), inspect)
+      end
+    end
+
+    # This class is used to instrument the execution of a single middleware.
+    # It proxies the `call` method transparently and instruments the method
+    # call.
+    class InstrumentationProxy
+      EVENT_NAME = "process_middleware.action_dispatch"
+
+      def initialize(middleware, class_name)
+        @middleware = middleware
+
+        @payload = {
+          middleware: class_name,
+        }
+      end
+
+      def call(env)
+        ActiveSupport::Notifications.instrument(EVENT_NAME, @payload) do
+          @middleware.call(env)
+        end
       end
     end
 
@@ -88,7 +115,6 @@ module ActionDispatch
     end
 
     def delete(target)
-      target = get_class target
       middlewares.delete_if { |m| m.klass == target }
     end
 
@@ -96,38 +122,26 @@ module ActionDispatch
       middlewares.push(build_middleware(klass, args, block))
     end
 
-    def build(app = Proc.new)
-      middlewares.freeze.reverse.inject(app) { |a, e| e.build(a) }
-    end
-
-    private
-
-    def assert_index(index, where)
-      index = get_class index
-      i = index.is_a?(Integer) ? index : middlewares.index { |m| m.klass == index }
-      raise "No such middleware to insert #{where}: #{index.inspect}" unless i
-      i
-    end
-
-    def get_class(klass)
-      if klass.is_a?(String) || klass.is_a?(Symbol)
-        classcache = ActiveSupport::Dependencies::Reference
-        converted_klass = classcache[klass.to_s]
-        ActiveSupport::Deprecation.warn <<-eowarn
-Passing strings or symbols to the middleware builder is deprecated, please change
-them to actual class references.  For example:
-
-  "#{klass}" => #{converted_klass}
-
-        eowarn
-        converted_klass
-      else
-        klass
+    def build(app = nil, &block)
+      instrumenting = ActiveSupport::Notifications.notifier.listening?(InstrumentationProxy::EVENT_NAME)
+      middlewares.freeze.reverse.inject(app || block) do |a, e|
+        if instrumenting
+          e.build_instrumented(a)
+        else
+          e.build(a)
+        end
       end
     end
 
-    def build_middleware(klass, args, block)
-      Middleware.new(get_class(klass), args, block)
-    end
+    private
+      def assert_index(index, where)
+        i = index.is_a?(Integer) ? index : middlewares.index { |m| m.klass == index }
+        raise "No such middleware to insert #{where}: #{index.inspect}" unless i
+        i
+      end
+
+      def build_middleware(klass, args, block)
+        Middleware.new(klass, args, block)
+      end
   end
 end

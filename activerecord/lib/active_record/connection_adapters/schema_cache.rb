@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 module ActiveRecord
   module ConnectionAdapters
     class SchemaCache
@@ -11,6 +13,7 @@ module ActiveRecord
         @columns_hash = {}
         @primary_keys = {}
         @data_sources = {}
+        @indexes      = {}
       end
 
       def initialize_dup(other)
@@ -19,6 +22,27 @@ module ActiveRecord
         @columns_hash = @columns_hash.dup
         @primary_keys = @primary_keys.dup
         @data_sources = @data_sources.dup
+        @indexes      = @indexes.dup
+      end
+
+      def encode_with(coder)
+        coder["columns"]          = @columns
+        coder["primary_keys"]     = @primary_keys
+        coder["data_sources"]     = @data_sources
+        coder["indexes"]          = @indexes
+        coder["version"]          = connection.migration_context.current_version
+        coder["database_version"] = database_version
+      end
+
+      def init_with(coder)
+        @columns          = coder["columns"]
+        @primary_keys     = coder["primary_keys"]
+        @data_sources     = coder["data_sources"]
+        @indexes          = coder["indexes"] || {}
+        @version          = coder["version"]
+        @database_version = coder["database_version"]
+
+        derive_columns_hash_and_deduplicate_values
       end
 
       def primary_keys(table_name)
@@ -32,9 +56,6 @@ module ActiveRecord
 
         @data_sources[name] = connection.data_source_exists?(name)
       end
-      alias table_exists? data_source_exists?
-      deprecate :table_exists? => "use #data_source_exists? instead"
-
 
       # Add internal cache for table with +table_name+.
       def add(table_name)
@@ -42,14 +63,13 @@ module ActiveRecord
           primary_keys(table_name)
           columns(table_name)
           columns_hash(table_name)
+          indexes(table_name)
         end
       end
 
       def data_sources(name)
         @data_sources[name]
       end
-      alias tables data_sources
-      deprecate :tables => "use #data_sources instead"
 
       # Get the columns for a table
       def columns(table_name)
@@ -59,9 +79,20 @@ module ActiveRecord
       # Get the columns for a table as a hash, key is the column name
       # value is the column object.
       def columns_hash(table_name)
-        @columns_hash[table_name] ||= Hash[columns(table_name).map { |col|
-          [col.name, col]
-        }]
+        @columns_hash[table_name] ||= columns(table_name).index_by(&:name)
+      end
+
+      # Checks whether the columns hash is already cached for a table.
+      def columns_hash?(table_name)
+        @columns_hash.key?(table_name)
+      end
+
+      def indexes(table_name)
+        @indexes[table_name] ||= connection.indexes(table_name)
+      end
+
+      def database_version # :nodoc:
+        @database_version ||= connection.get_database_version
       end
 
       # Clears out internal caches
@@ -70,11 +101,13 @@ module ActiveRecord
         @columns_hash.clear
         @primary_keys.clear
         @data_sources.clear
+        @indexes.clear
         @version = nil
+        @database_version = nil
       end
 
       def size
-        [@columns, @columns_hash, @primary_keys, @data_sources].map(&:size).inject :+
+        [@columns, @columns_hash, @primary_keys, @data_sources].sum(&:size)
       end
 
       # Clear out internal caches for the data source +name+.
@@ -83,21 +116,43 @@ module ActiveRecord
         @columns_hash.delete name
         @primary_keys.delete name
         @data_sources.delete name
+        @indexes.delete name
       end
-      alias clear_table_cache! clear_data_source_cache!
-      deprecate :clear_table_cache! => "use #clear_data_source_cache! instead"
 
       def marshal_dump
         # if we get current version during initialization, it happens stack over flow.
-        @version = ActiveRecord::Migrator.current_version
-        [@version, @columns, @columns_hash, @primary_keys, @data_sources]
+        @version = connection.migration_context.current_version
+        [@version, @columns, {}, @primary_keys, @data_sources, @indexes, database_version]
       end
 
       def marshal_load(array)
-        @version, @columns, @columns_hash, @primary_keys, @data_sources = array
+        @version, @columns, _columns_hash, @primary_keys, @data_sources, @indexes, @database_version = array
+        @indexes ||= {}
+
+        derive_columns_hash_and_deduplicate_values
       end
 
       private
+        def derive_columns_hash_and_deduplicate_values
+          @columns      = deep_deduplicate(@columns)
+          @columns_hash = @columns.transform_values { |columns| columns.index_by(&:name) }
+          @primary_keys = deep_deduplicate(@primary_keys)
+          @data_sources = deep_deduplicate(@data_sources)
+          @indexes      = deep_deduplicate(@indexes)
+        end
+
+        def deep_deduplicate(value)
+          case value
+          when Hash
+            value.transform_keys { |k| deep_deduplicate(k) }.transform_values { |v| deep_deduplicate(v) }
+          when Array
+            value.map { |i| deep_deduplicate(i) }
+          when String, Deduplicable
+            -value
+          else
+            value
+          end
+        end
 
         def prepare_data_sources
           connection.data_sources.each { |source| @data_sources[source] = true }

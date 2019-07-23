@@ -1,4 +1,6 @@
+# frozen_string_literal: true
+
 Throws = 1
-A::B # Autoloading recursion, expected to be discarded.
+_ = A::B # Autoloading recursion, expected to be discarded.
 
 throw :t

@@ -1,9 +1,10 @@
-require 'active_support/core_ext/string/multibyte'
-require 'active_support/i18n'
+# frozen_string_literal: true
+
+require "active_support/core_ext/string/multibyte"
+require "active_support/i18n"
 
 module ActiveSupport
   module Inflector
-
     # Replaces non-ASCII characters with an ASCII approximation, or if none
     # exists, a replacement character which defaults to "?".
     #
@@ -50,48 +51,56 @@ module ActiveSupport
     #
     # Now you can have different transliterations for each locale:
     #
-    #   I18n.locale = :en
-    #   transliterate('Jürgen')
+    #   transliterate('Jürgen', locale: :en)
     #   # => "Jurgen"
     #
-    #   I18n.locale = :de
-    #   transliterate('Jürgen')
+    #   transliterate('Jürgen', locale: :de)
     #   # => "Juergen"
-    def transliterate(string, replacement = "?".freeze)
-      I18n.transliterate(ActiveSupport::Multibyte::Unicode.normalize(
-        ActiveSupport::Multibyte::Unicode.tidy_bytes(string), :c),
-          :replacement => replacement)
+    def transliterate(string, replacement = "?", locale: nil)
+      raise ArgumentError, "Can only transliterate strings. Received #{string.class.name}" unless string.is_a?(String)
+
+      I18n.transliterate(
+        ActiveSupport::Multibyte::Unicode.tidy_bytes(string).unicode_normalize(:nfc),
+        replacement: replacement,
+        locale: locale
+      )
     end
 
     # Replaces special characters in a string so that it may be used as part of
     # a 'pretty' URL.
     #
     #   parameterize("Donald E. Knuth") # => "donald-e-knuth"
-    #   parameterize("^trés|Jolie-- ")  # => "tres-jolie"
+    #   parameterize("^très|Jolie-- ")  # => "tres-jolie"
     #
-    # To use a custom separator, override the `separator` argument.
+    # To use a custom separator, override the +separator+ argument.
     #
-    #  parameterize("Donald E. Knuth", separator: '_') # => "donald_e_knuth"
-    #  parameterize("^trés|Jolie-- ", separator: '_')  # => "tres_jolie"
+    #   parameterize("Donald E. Knuth", separator: '_') # => "donald_e_knuth"
+    #   parameterize("^très|Jolie__ ", separator: '_')  # => "tres_jolie"
     #
-    # To preserve the case of the characters in a string, use the `preserve_case` argument.
+    # To preserve the case of the characters in a string, use the +preserve_case+ argument.
     #
     #   parameterize("Donald E. Knuth", preserve_case: true) # => "Donald-E-Knuth"
-    #   parameterize("^trés|Jolie-- ", preserve_case: true) # => "tres-Jolie"
+    #   parameterize("^très|Jolie-- ", preserve_case: true) # => "tres-Jolie"
     #
-    def parameterize(string, sep = :unused, separator: '-', preserve_case: false)
-      unless sep == :unused
-        ActiveSupport::Deprecation.warn("Passing the separator argument as a positional parameter is deprecated and will soon be removed. Use `separator: '#{sep}'` instead.")
-        separator = sep
-      end
+    # It preserves dashes and underscores unless they are used as separators:
+    #
+    #   parameterize("^très|Jolie__ ")                 # => "tres-jolie__"
+    #   parameterize("^très|Jolie-- ", separator: "_") # => "tres_jolie--"
+    #   parameterize("^très_Jolie-- ", separator: ".") # => "tres_jolie--"
+    #
+    # If the optional parameter +locale+ is specified,
+    # the word will be parameterized as a word of that language.
+    # By default, this parameter is set to <tt>nil</tt> and it will use
+    # the configured <tt>I18n.locale<tt>.
+    def parameterize(string, separator: "-", preserve_case: false, locale: nil)
       # Replace accented chars with their ASCII equivalents.
-      parameterized_string = transliterate(string)
+      parameterized_string = transliterate(string, locale: locale)
 
       # Turn unwanted chars into the separator.
       parameterized_string.gsub!(/[^a-z0-9\-_]+/i, separator)
 
       unless separator.nil? || separator.empty?
-        if separator == "-".freeze
+        if separator == "-"
           re_duplicate_separator        = /-{2,}/
           re_leading_trailing_separator = /^-|-$/i
         else
@@ -102,9 +111,9 @@ module ActiveSupport
         # No more than one of the separator in a row.
         parameterized_string.gsub!(re_duplicate_separator, separator)
         # Remove leading/trailing separator.
-        parameterized_string.gsub!(re_leading_trailing_separator, ''.freeze)
+        parameterized_string.gsub!(re_leading_trailing_separator, "")
       end
-      
+
       parameterized_string.downcase! unless preserve_case
       parameterized_string
     end

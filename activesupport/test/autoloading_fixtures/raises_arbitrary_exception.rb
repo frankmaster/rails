@@ -1,4 +1,6 @@
-RaisesArbitraryException = 1
-A::B # Autoloading recursion, also expected to be watched and discarded.
+# frozen_string_literal: true
 
-raise Exception, 'arbitray exception message'
+RaisesArbitraryException = 1
+_ = A::B # Autoloading recursion, also expected to be watched and discarded.
+
+raise Exception, "arbitrary exception message"

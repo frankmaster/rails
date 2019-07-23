@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 module ActiveRecord
   module Validations
     class AssociatedValidator < ActiveModel::EachValidator #:nodoc:
@@ -8,7 +10,6 @@ module ActiveRecord
       end
 
       private
-
         def valid_object?(record)
           (record.respond_to?(:marked_for_destruction?) && record.marked_for_destruction?) || record.valid?
         end
@@ -37,7 +38,7 @@ module ActiveRecord
       #
       # * <tt>:message</tt> - A custom error message (default is: "is invalid").
       # * <tt>:on</tt> - Specifies the contexts where this validation is active.
-      #   Runs in all validation contexts by default (nil). You can pass a symbol
+      #   Runs in all validation contexts by default +nil+. You can pass a symbol
       #   or an array of symbols. (e.g. <tt>on: :create</tt> or
       #   <tt>on: :custom_validation_context</tt> or
       #   <tt>on: [:create, :custom_validation_context]</tt>)

@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 module ActionView
   module Helpers
     module Tags # :nodoc:
@@ -9,7 +11,6 @@ module ActionView
         end
 
         private
-
           def format_date(value)
             value.try(:strftime, "%Y-%m-%dT%T")
           end

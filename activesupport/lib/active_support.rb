@@ -1,5 +1,7 @@
+# frozen_string_literal: true
+
 #--
-# Copyright (c) 2005-2016 David Heinemeier Hansson
+# Copyright (c) 2005-2019 David Heinemeier Hansson
 #
 # Permission is hereby granted, free of charge, to any person obtaining
 # a copy of this software and associated documentation files (the
@@ -21,16 +23,19 @@
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #++
 
-require 'securerandom'
+require "securerandom"
 require "active_support/dependencies/autoload"
 require "active_support/version"
 require "active_support/logger"
 require "active_support/lazy_load_hooks"
+require "active_support/core_ext/date_and_time/compatibility"
 
 module ActiveSupport
   extend ActiveSupport::Autoload
 
   autoload :Concern
+  autoload :ActionableError
+  autoload :CurrentAttributes
   autoload :Dependencies
   autoload :DescendantsTracker
   autoload :ExecutionWrapper
@@ -49,6 +54,7 @@ module ActiveSupport
     autoload :Callbacks
     autoload :Configurable
     autoload :Deprecation
+    autoload :Digest
     autoload :Gzip
     autoload :Inflector
     autoload :JSON
@@ -78,12 +84,12 @@ module ActiveSupport
 
   cattr_accessor :test_order # :nodoc:
 
-  def self.halt_callback_chains_on_return_false
-    Callbacks.halt_and_display_warning_on_return_false
+  def self.to_time_preserves_timezone
+    DateAndTime::Compatibility.preserve_timezone
   end
 
-  def self.halt_callback_chains_on_return_false=(value)
-    Callbacks.halt_and_display_warning_on_return_false = value
+  def self.to_time_preserves_timezone=(value)
+    DateAndTime::Compatibility.preserve_timezone = value
   end
 end
 
