@@ -47,10 +47,68 @@ module ActiveRecord
   class AdapterNotFound < ActiveRecordError
   end
 
+  # Superclass for all errors raised from an Active Record adapter.
+  class AdapterError < ActiveRecordError
+    def initialize(message = nil, connection_pool: nil)
+      @connection_pool = connection_pool
+      super(message)
+    end
+
+    attr_reader :connection_pool
+  end
+
   # Raised when connection to the database could not been established (for example when
-  # {ActiveRecord::Base.connection=}[rdoc-ref:ConnectionHandling#connection]
+  # {ActiveRecord::Base.lease_connection=}[rdoc-ref:ConnectionHandling#lease_connection]
   # is given a +nil+ object).
-  class ConnectionNotEstablished < ActiveRecordError
+  class ConnectionNotEstablished < AdapterError
+    def initialize(message = nil, connection_pool: nil)
+      super(message, connection_pool: connection_pool)
+    end
+
+    def set_pool(connection_pool)
+      unless @connection_pool
+        @connection_pool = connection_pool
+      end
+
+      self
+    end
+  end
+
+  # Raised when a connection could not be obtained within the connection
+  # acquisition timeout period: because max connections in pool
+  # are in use.
+  class ConnectionTimeoutError < ConnectionNotEstablished
+  end
+
+  # Raised when connection to the database could not been established because it was not
+  # able to connect to the host or when the authorization failed.
+  class DatabaseConnectionError < ConnectionNotEstablished
+    def initialize(message = nil)
+      super(message || "Database connection error")
+    end
+
+    class << self
+      def hostname_error(hostname)
+        DatabaseConnectionError.new(<<~MSG)
+          There is an issue connecting with your hostname: #{hostname}.\n
+          Please check your database configuration and ensure there is a valid connection to your database.
+        MSG
+      end
+
+      def username_error(username)
+        DatabaseConnectionError.new(<<~MSG)
+          There is an issue connecting to your database with your username/password, username: #{username}.\n
+          Please check your database configuration to ensure the username/password are valid.
+        MSG
+      end
+    end
+  end
+
+  # Raised when a pool was unable to get ahold of all its connections
+  # to perform a "group" action such as
+  # {ActiveRecord::Base.connection_pool.disconnect!}[rdoc-ref:ConnectionAdapters::ConnectionPool#disconnect!]
+  # or {ActiveRecord::Base.connection_handler.clear_reloadable_connections!}[rdoc-ref:ConnectionAdapters::ConnectionHandler#clear_reloadable_connections!].
+  class ExclusiveConnectionTimeoutError < ConnectionTimeoutError
   end
 
   # Raised when a write to the database is attempted on a read only connection.
@@ -83,7 +141,7 @@ module ActiveRecord
   end
 
   # Raised by {ActiveRecord::Base#destroy!}[rdoc-ref:Persistence#destroy!]
-  # when a call to {#destroy}[rdoc-ref:Persistence#destroy!]
+  # when a call to {#destroy}[rdoc-ref:Persistence#destroy]
   # would return false.
   #
   #   begin
@@ -101,17 +159,36 @@ module ActiveRecord
     end
   end
 
+  # Raised when Active Record finds multiple records but only expected one.
+  class SoleRecordExceeded < ActiveRecordError
+    attr_reader :record
+
+    def initialize(record = nil)
+      @record = record
+      super "Wanted only one #{record&.name || "record"}"
+    end
+  end
+
   # Superclass for all database execution errors.
   #
   # Wraps the underlying database error as +cause+.
-  class StatementInvalid < ActiveRecordError
-    def initialize(message = nil, sql: nil, binds: nil)
-      super(message || $!.try(:message))
+  class StatementInvalid < AdapterError
+    def initialize(message = nil, sql: nil, binds: nil, connection_pool: nil)
+      super(message || $!&.message, connection_pool: connection_pool)
       @sql = sql
       @binds = binds
     end
 
     attr_reader :sql, :binds
+
+    def set_query(sql, binds)
+      unless @sql
+        @sql = sql
+        @binds = binds
+      end
+
+      self
+    end
   end
 
   # Defunct wrapper class kept for compatibility.
@@ -138,8 +215,13 @@ module ActiveRecord
       foreign_key: nil,
       target_table: nil,
       primary_key: nil,
-      primary_key_column: nil
+      primary_key_column: nil,
+      query_parser: nil,
+      connection_pool: nil
     )
+      @original_message = message
+      @query_parser = query_parser
+
       if table
         type = primary_key_column.bigint? ? :bigint : primary_key_column.type
         msg = <<~EOM.squish
@@ -157,7 +239,24 @@ module ActiveRecord
       if message
         msg << "\nOriginal message: #{message}"
       end
-      super(msg, sql: sql, binds: binds)
+
+      super(msg, sql: sql, binds: binds, connection_pool: connection_pool)
+    end
+
+    def set_query(sql, binds)
+      if @query_parser && !@sql
+        self.class.new(
+          message: @original_message,
+          sql: sql,
+          binds: binds,
+          connection_pool: @connection_pool,
+          **@query_parser.call(sql)
+        ).tap do |exception|
+          exception.set_backtrace backtrace
+        end
+      else
+        super
+      end
     end
   end
 
@@ -173,9 +272,22 @@ module ActiveRecord
   class RangeError < StatementInvalid
   end
 
-  # Raised when number of bind variables in statement given to +:condition+ key
-  # (for example, when using {ActiveRecord::Base.find}[rdoc-ref:FinderMethods#find] method)
-  # does not match number of expected values supplied.
+  # Raised when a statement produces an SQL warning.
+  class SQLWarning < AdapterError
+    attr_reader :code, :level
+    attr_accessor :sql
+
+    def initialize(message = nil, code = nil, level = nil, sql = nil, connection_pool = nil)
+      super(message, connection_pool: connection_pool)
+      @code = code
+      @level = level
+      @sql = sql
+    end
+  end
+
+  # Raised when the number of placeholders in an SQL fragment passed to
+  # {ActiveRecord::Base.where}[rdoc-ref:QueryMethods#where]
+  # does not match the number of values supplied.
   #
   # For example, when there are two placeholders with only one value supplied:
   #
@@ -185,6 +297,35 @@ module ActiveRecord
 
   # Raised when a given database does not exist.
   class NoDatabaseError < StatementInvalid
+    include ActiveSupport::ActionableError
+
+    action "Create database" do
+      ActiveRecord::Tasks::DatabaseTasks.create_current
+    end
+
+    def initialize(message = nil, connection_pool: nil)
+      super(message || "Database not found", connection_pool: connection_pool)
+    end
+
+    class << self
+      def db_error(db_name)
+        NoDatabaseError.new(<<~MSG)
+          We could not find your database: #{db_name}. Available database configurations can be found in config/database.yml.
+
+          To resolve this error:
+
+          - Did you not create the database, or did you delete it? To create the database, run:
+
+              bin/rails db:create
+
+          - Has the database name changed? Verify that config/database.yml contains the correct database name.
+        MSG
+      end
+    end
+  end
+
+  # Raised when creating a database if it exists.
+  class DatabaseAlreadyExists < StatementInvalid
   end
 
   # Raised when PostgreSQL returns 'cached plan must not change result type' and
@@ -224,6 +365,16 @@ module ActiveRecord
   class ReadOnlyRecord < ActiveRecordError
   end
 
+  # Raised on attempt to lazily load records that are marked as strict loading.
+  #
+  # You can resolve this error by eager loading marked records before accessing
+  # them. The
+  # {Eager Loading Associations}[https://guides.rubyonrails.org/active_record_querying.html#eager-loading-associations]
+  # guide covers solutions, such as using
+  # {ActiveRecord::Base.includes}[rdoc-ref:QueryMethods#includes].
+  class StrictLoadingViolationError < ActiveRecordError
+  end
+
   # {ActiveRecord::Base.transaction}[rdoc-ref:Transactions::ClassMethods#transaction]
   # uses this exception to distinguish a deliberate rollback from other exceptional situations.
   # Normally, raising an exception will cause the
@@ -243,7 +394,7 @@ module ActiveRecord
   #           # The system must fail on Friday so that our support department
   #           # won't be out of job. We silently rollback this transaction
   #           # without telling the user.
-  #           raise ActiveRecord::Rollback, "Call tech support!"
+  #           raise ActiveRecord::Rollback
   #         end
   #       end
   #       # ActiveRecord::Rollback is the only exception that won't be passed on
@@ -324,27 +475,51 @@ module ActiveRecord
   # * You are joining an existing open transaction
   # * You are creating a nested (savepoint) transaction
   #
-  # The mysql2 and postgresql adapters support setting the transaction isolation level.
+  # The mysql2, trilogy, and postgresql adapters support setting the transaction isolation level.
   class TransactionIsolationError < ActiveRecordError
   end
 
   # TransactionRollbackError will be raised when a transaction is rolled
   # back by the database due to a serialization failure or a deadlock.
   #
+  # These exceptions should not be generally rescued in nested transaction
+  # blocks, because they have side-effects in the actual enclosing transaction
+  # and internal Active Record state. They can be rescued if you are above the
+  # root transaction block, though.
+  #
+  # In that case, beware of transactional tests, however, because they run test
+  # cases in their own umbrella transaction. If you absolutely need to handle
+  # these exceptions in tests please consider disabling transactional tests in
+  # the affected test class (<tt>self.use_transactional_tests = false</tt>).
+  #
+  # Due to the aforementioned side-effects, this exception should not be raised
+  # manually by users.
+  #
   # See the following:
   #
   # * https://www.postgresql.org/docs/current/static/transaction-iso.html
-  # * https://dev.mysql.com/doc/refman/5.7/en/error-messages-server.html#error_er_lock_deadlock
+  # * https://dev.mysql.com/doc/mysql-errors/en/server-error-reference.html#error_er_lock_deadlock
   class TransactionRollbackError < StatementInvalid
+  end
+
+  # AsynchronousQueryInsideTransactionError will be raised when attempting
+  # to perform an asynchronous query from inside a transaction
+  class AsynchronousQueryInsideTransactionError < ActiveRecordError
   end
 
   # SerializationFailure will be raised when a transaction is rolled
   # back by the database due to a serialization failure.
+  #
+  # This is a subclass of TransactionRollbackError, please make sure to check
+  # its documentation to be aware of its caveats.
   class SerializationFailure < TransactionRollbackError
   end
 
   # Deadlocked will be raised when a transaction is rolled
   # back by the database when a deadlock is encountered.
+  #
+  # This is a subclass of TransactionRollbackError, please make sure to check
+  # its documentation to be aware of its caveats.
   class Deadlocked < TransactionRollbackError
   end
 
@@ -373,25 +548,28 @@ module ActiveRecord
   class AdapterTimeout < QueryAborted
   end
 
+  # ConnectionFailed will be raised when the network connection to the
+  # database fails while sending a query or waiting for its result.
+  class ConnectionFailed < QueryAborted
+  end
+
   # UnknownAttributeReference is raised when an unknown and potentially unsafe
-  # value is passed to a query method when allow_unsafe_raw_sql is set to
-  # :disabled. For example, passing a non column name value to a relation's
-  # #order method might cause this exception.
+  # value is passed to a query method. For example, passing a non column name
+  # value to a relation's #order method might cause this exception.
   #
   # When working around this exception, caution should be taken to avoid SQL
   # injection vulnerabilities when passing user-provided values to query
   # methods. Known-safe values can be passed to query methods by wrapping them
   # in Arel.sql.
   #
-  # For example, with allow_unsafe_raw_sql set to :disabled, the following
-  # code would raise this exception:
+  # For example, the following code would raise this exception:
   #
-  #   Post.order("length(title)").first
+  #   Post.order("REPLACE(title, 'misc', 'zzzz') asc").pluck(:id)
   #
   # The desired result can be accomplished by wrapping the known-safe string
   # in Arel.sql:
   #
-  #   Post.order(Arel.sql("length(title)")).first
+  #   Post.order(Arel.sql("REPLACE(title, 'misc', 'zzzz') asc")).pluck(:id)
   #
   # Again, such a workaround should *not* be used when passing user-provided
   # values, such as request parameters or model attributes to query methods.

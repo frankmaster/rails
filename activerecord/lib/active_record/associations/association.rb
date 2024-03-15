@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-require "active_support/core_ext/array/wrap"
-
 module ActiveRecord
   module Associations
     # = Active Record Associations
@@ -21,7 +19,7 @@ module ActiveRecord
     # Associations in Active Record are middlemen between the object that
     # holds the association, known as the <tt>owner</tt>, and the associated
     # result set, known as the <tt>target</tt>. Association metadata is available in
-    # <tt>reflection</tt>, which is an instance of <tt>ActiveRecord::Reflection::AssociationReflection</tt>.
+    # <tt>reflection</tt>, which is an instance of +ActiveRecord::Reflection::AssociationReflection+.
     #
     # For example, given
     #
@@ -34,8 +32,9 @@ module ActiveRecord
     # The association of <tt>blog.posts</tt> has the object +blog+ as its
     # <tt>owner</tt>, the collection of its posts as <tt>target</tt>, and
     # the <tt>reflection</tt> object represents a <tt>:has_many</tt> macro.
-    class Association #:nodoc:
-      attr_reader :owner, :target, :reflection
+    class Association # :nodoc:
+      attr_accessor :owner
+      attr_reader :target, :reflection, :disable_joins
 
       delegate :options, to: :reflection
 
@@ -43,23 +42,28 @@ module ActiveRecord
         reflection.check_validity!
 
         @owner, @reflection = owner, reflection
+        @disable_joins = @reflection.options[:disable_joins] || false
 
         reset
         reset_scope
+
+        @skip_strict_loading = nil
       end
 
       # Resets the \loaded flag to +false+ and sets the \target to +nil+.
       def reset
         @loaded = false
-        @target = nil
         @stale_state = nil
-        @inversed = false
+      end
+
+      def reset_negative_cache # :nodoc:
+        reset if loaded? && target.nil?
       end
 
       # Reloads the \target and returns +self+ on success.
       # The QueryCache is cleared if +force+ is true.
       def reload(force = false)
-        klass.connection.clear_query_cache if force && klass
+        klass.connection_pool.clear_query_cache if force && klass
         reset
         reset_scope
         load_target
@@ -75,7 +79,6 @@ module ActiveRecord
       def loaded!
         @loaded = true
         @stale_state = stale_state
-        @inversed = false
       end
 
       # The target is stale if the target no longer points to the record(s) that the
@@ -85,7 +88,7 @@ module ActiveRecord
       #
       # Note that if the target has not been loaded, it is not considered stale.
       def stale_target?
-        !@inversed && loaded? && @stale_state != stale_state
+        loaded? && @stale_state != stale_state
       end
 
       # Sets the target of this association to <tt>\target</tt>, and the \loaded flag to +true+.
@@ -95,7 +98,15 @@ module ActiveRecord
       end
 
       def scope
-        target_scope.merge!(association_scope)
+        if disable_joins
+          DisableJoinsAssociationScope.create.scope(self)
+        elsif (scope = klass.current_scope) && scope.try(:proxy_association) == self
+          scope.spawn
+        elsif scope = klass.global_current_scope
+          target_scope.merge!(association_scope).merge!(scope)
+        else
+          target_scope.merge!(association_scope)
+        end
       end
 
       def reset_scope
@@ -126,9 +137,13 @@ module ActiveRecord
 
       def inversed_from(record)
         self.target = record
-        @inversed = !!record
       end
-      alias :inversed_from_queries :inversed_from
+
+      def inversed_from_queries(record)
+        if inversable?(record)
+          self.target = record
+        end
+      end
 
       # Returns the class of the target. belongs_to polymorphic overrides this to look at the
       # polymorphic_type field on the owner.
@@ -177,7 +192,7 @@ module ActiveRecord
         @reflection = @owner.class._reflect_on_association(reflection_name)
       end
 
-      def initialize_attributes(record, except_from_scope_attributes = nil) #:nodoc:
+      def initialize_attributes(record, except_from_scope_attributes = nil) # :nodoc:
         except_from_scope_attributes ||= {}
         skip_assign = [reflection.foreign_key, reflection.type].compact
         assigned_keys = record.changed_attribute_names_to_save
@@ -187,27 +202,63 @@ module ActiveRecord
         set_inverse_instance(record)
       end
 
-      def create(attributes = {}, &block)
+      def create(attributes = nil, &block)
         _create_record(attributes, &block)
       end
 
-      def create!(attributes = {}, &block)
+      def create!(attributes = nil, &block)
         _create_record(attributes, true, &block)
       end
 
       private
+        # Reader and writer methods call this so that consistent errors are presented
+        # when the association target class does not exist.
+        def ensure_klass_exists!
+          klass
+        end
+
         def find_target
+          if violates_strict_loading?
+            Base.strict_loading_violation!(owner: owner.class, reflection: reflection)
+          end
+
           scope = self.scope
           return scope.to_a if skip_statement_cache?(scope)
 
-          conn = klass.connection
-          sc = reflection.association_scope_cache(conn, owner) do |params|
+          sc = reflection.association_scope_cache(klass, owner) do |params|
             as = AssociationScope.create { params.bind }
             target_scope.merge!(as.scope(self))
           end
 
           binds = AssociationScope.get_bind_values(owner, reflection.chain)
-          sc.execute(binds, conn) { |record| set_inverse_instance(record) } || []
+          klass.with_connection do |c|
+            sc.execute(binds, c) do |record|
+              set_inverse_instance(record)
+              if owner.strict_loading_n_plus_one_only? && reflection.macro == :has_many
+                record.strict_loading!
+              else
+                record.strict_loading!(false, mode: owner.strict_loading_mode)
+              end
+            end
+          end
+        end
+
+        def skip_strict_loading(&block)
+          skip_strict_loading_was = @skip_strict_loading
+          @skip_strict_loading = true
+          yield
+        ensure
+          @skip_strict_loading = skip_strict_loading_was
+        end
+
+        def violates_strict_loading?
+          return if @skip_strict_loading
+
+          return unless owner.validation_context.nil?
+
+          return reflection.strict_loading? if reflection.options.key?(:strict_loading)
+
+          owner.strict_loading? && !owner.strict_loading_n_plus_one_only?
         end
 
         # The scope for this association.
@@ -218,7 +269,11 @@ module ActiveRecord
         # actually gets built.
         def association_scope
           if klass
-            @association_scope ||= AssociationScope.scope(self)
+            @association_scope ||= if disable_joins
+              DisableJoinsAssociationScope.scope(self)
+            else
+              AssociationScope.scope(self)
+            end
           end
         end
 
@@ -236,25 +291,6 @@ module ActiveRecord
           !loaded? && (!owner.new_record? || foreign_key_present?) && klass
         end
 
-        def creation_attributes
-          attributes = {}
-
-          if (reflection.has_one? || reflection.collection?) && !options[:through]
-            attributes[reflection.foreign_key] = owner[reflection.active_record_primary_key]
-
-            if reflection.type
-              attributes[reflection.type] = owner.class.polymorphic_name
-            end
-          end
-
-          attributes
-        end
-
-        # Sets the owner attributes on the given record
-        def set_owner_attributes(record)
-          creation_attributes.each { |key, value| record[key] = value }
-        end
-
         # Returns true if there is a foreign key present on the owner which
         # references the target. This is used to determine whether we can load
         # the target if the owner is currently a new record (and therefore
@@ -269,7 +305,7 @@ module ActiveRecord
 
         # Raises ActiveRecord::AssociationTypeMismatch unless +record+ is of
         # the kind of the class of the associated objects. Meant to be used as
-        # a sanity check when you are about to assign an associated record.
+        # a safety check when you are about to assign an associated record.
         def raise_on_type_mismatch!(record)
           unless record.is_a?(reflection.klass)
             fresh_class = reflection.class_name.safe_constantize
@@ -302,7 +338,8 @@ module ActiveRecord
 
         # Returns true if record contains the foreign_key
         def foreign_key_for?(record)
-          record.has_attribute?(reflection.foreign_key)
+          foreign_key = Array(reflection.foreign_key)
+          foreign_key.all? { |key| record._has_attribute?(key) }
         end
 
         # This should be implemented to return the values of the relevant key(s) on the owner,
@@ -326,6 +363,28 @@ module ActiveRecord
             scope.eager_loading? ||
             klass.scope_attributes? ||
             reflection.source_reflection.active_record.default_scopes.any?
+        end
+
+        def enqueue_destroy_association(options)
+          job_class = owner.class.destroy_association_async_job
+
+          if job_class
+            owner._after_commit_jobs.push([job_class, options])
+          end
+        end
+
+        def inversable?(record)
+          record &&
+            ((!record.persisted? || !owner.persisted?) || matches_foreign_key?(record))
+        end
+
+        def matches_foreign_key?(record)
+          if foreign_key_for?(record)
+            record.read_attribute(reflection.foreign_key) == owner.id ||
+              (foreign_key_for?(owner) && owner.read_attribute(reflection.foreign_key) == record.id)
+          else
+            owner.read_attribute(reflection.foreign_key) == record.id
+          end
         end
     end
   end

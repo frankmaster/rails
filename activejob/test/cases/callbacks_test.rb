@@ -16,6 +16,32 @@ class CallbacksTest < ActiveSupport::TestCase
     assert "CallbackJob ran around_perform_stop".in? performed_callback_job.history
   end
 
+  test "perform return value" do
+    job = Class.new(ActiveJob::Base) do
+      def perform
+        123
+      end
+    end
+
+    assert_equal(123, job.perform_now)
+  end
+
+  test "perform around_callbacks return value" do
+    value = nil
+
+    Class.new(ActiveJob::Base) do
+      around_perform do |_, block|
+        value = block.call
+      end
+
+      def perform
+        123
+      end
+    end.perform_now
+
+    assert_equal(123, value)
+  end
+
   test "enqueue callbacks" do
     enqueued_callback_job = CallbackJob.perform_later
     assert "CallbackJob ran before_enqueue".in? enqueued_callback_job.history
@@ -24,23 +50,22 @@ class CallbacksTest < ActiveSupport::TestCase
     assert "CallbackJob ran around_enqueue_stop".in? enqueued_callback_job.history
   end
 
-  test "#enqueue returns false when before_enqueue aborts callback chain and return_false_on_aborted_enqueue = true" do
-    prev = ActiveJob::Base.return_false_on_aborted_enqueue
-    ActiveJob::Base.return_false_on_aborted_enqueue = true
+  test "#enqueue returns false when before_enqueue aborts callback chain" do
     assert_equal false, AbortBeforeEnqueueJob.new.enqueue
-  ensure
-    ActiveJob::Base.return_false_on_aborted_enqueue = prev
   end
 
-  test "#enqueue returns self when before_enqueue aborts callback chain and return_false_on_aborted_enqueue = false" do
-    prev = ActiveJob::Base.return_false_on_aborted_enqueue
-    ActiveJob::Base.return_false_on_aborted_enqueue = false
+  test "#enqueue does not run after_enqueue callbacks when previous callbacks aborted" do
     job = AbortBeforeEnqueueJob.new
-    assert_deprecated do
-      assert_equal job, job.enqueue
-    end
-  ensure
-    ActiveJob::Base.return_false_on_aborted_enqueue = prev
+    job.enqueue
+
+    assert_nil(job.flag)
+  end
+
+  test "#perform does not run after_perform callbacks when swhen previous callbacks aborted" do
+    job = AbortBeforeEnqueueJob.new
+    job.perform_now
+
+    assert_nil(job.flag)
   end
 
   test "#enqueue returns self when the job was enqueued" do

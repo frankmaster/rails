@@ -7,6 +7,7 @@ require "models/project"
 require "models/company"
 require "models/ship"
 require "models/pirate"
+require "models/person"
 require "models/car"
 require "models/bulb"
 require "models/author"
@@ -17,11 +18,13 @@ require "models/chef"
 require "models/department"
 require "models/club"
 require "models/membership"
+require "models/parrot"
+require "models/cpk"
 
 class HasOneAssociationsTest < ActiveRecord::TestCase
   self.use_transactional_tests = false unless supports_savepoints?
   fixtures :accounts, :companies, :developers, :projects, :developers_projects,
-           :ships, :pirates, :authors, :author_addresses, :memberships, :clubs
+           :ships, :pirates, :authors, :author_addresses, :books, :memberships, :clubs
 
   def setup
     Account.destroyed_account_ids.clear
@@ -30,23 +33,20 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
   def test_has_one
     firm = companies(:first_firm)
     first_account = Account.find(1)
-    assert_sql(/LIMIT|ROWNUM <=|FETCH FIRST/) do
+    assert_queries_match(/LIMIT|ROWNUM <=|FETCH FIRST/) do
       assert_equal first_account, firm.account
       assert_equal first_account.credit_limit, firm.account.credit_limit
     end
   end
 
   def test_has_one_does_not_use_order_by
-    ActiveRecord::SQLCounter.clear_log
-    companies(:first_firm).account
-  ensure
-    sql_log = ActiveRecord::SQLCounter.log
-    assert sql_log.all? { |sql| /order by/i !~ sql }, "ORDER BY was used in the query: #{sql_log}"
+    sql_log = capture_sql { companies(:first_firm).account }
+    assert sql_log.all? { |sql| !/order by/i.match?(sql) }, "ORDER BY was used in the query: #{sql_log}"
   end
 
   def test_has_one_cache_nils
     firm = companies(:another_firm)
-    assert_queries(1) { assert_nil firm.account }
+    assert_queries_count(1) { assert_nil firm.account }
     assert_no_queries { assert_nil firm.account }
 
     firms = Firm.includes(:account).to_a
@@ -54,8 +54,8 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
   end
 
   def test_with_select
-    assert_equal Firm.find(1).account_with_select.attributes.size, 2
-    assert_equal Firm.all.merge!(includes: :account_with_select).find(1).account_with_select.attributes.size, 2
+    assert_equal 2, Firm.find(1).account_with_select.attributes.size
+    assert_equal 2, Firm.all.merge!(includes: :account_with_select).find(1).account_with_select.attributes.size
   end
 
   def test_finding_using_primary_key
@@ -141,6 +141,17 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
     ship.destroy
     assert_not_predicate ship, :persisted?
     assert_not_predicate developer, :persisted?
+  end
+
+  def test_nullification_on_cpk_association
+    book = Cpk::Book.create!(id: [1, 2])
+    other_book = Cpk::Book.create!(id: [3, 4])
+    order = Cpk::OrderWithNullifiedBook.create!(book: book)
+
+    order.book = other_book
+
+    assert_nil book.order_id
+    assert_nil book.shop_id
   end
 
   def test_natural_assignment_to_nil_after_destroy
@@ -257,7 +268,7 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
 
   def test_build_association_dont_create_transaction
     firm = Firm.new
-    assert_queries(0) do
+    assert_queries_count(0) do
       firm.build_account
     end
   end
@@ -310,6 +321,19 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
     assert_equal account, firm.reload.account
   end
 
+  def test_clearing_an_association_clears_the_associations_inverse
+    author = Author.create(name: "Jimmy Tolkien")
+    post = author.create_post(title: "The silly medallion", body: "")
+    assert_equal post, author.post
+    assert_equal author, post.author
+
+    post.update!(author: nil)
+    assert_nil post.author
+
+    author.update!(name: "J.R.R. Tolkien")
+    assert_nil post.author
+  end
+
   def test_create_association_with_bang
     firm = Firm.create(name: "GlobalMegaCorp")
     account = firm.create_account!(credit_limit: 1000)
@@ -343,6 +367,7 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
     end
 
     assert_equal "You cannot call create unless the parent is saved", error.message
+    assert_equal firm, error.record
   end
 
   def test_reload_association
@@ -352,13 +377,15 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
     Account.where(id: odegy.account.id).update_all(credit_limit: 80)
     assert_equal 53, odegy.account.credit_limit
 
-    assert_equal 80, odegy.reload_account.credit_limit
+    assert_queries_count(1) { odegy.reload_account }
+    assert_no_queries { odegy.account }
+    assert_equal 80, odegy.account.credit_limit
   end
 
   def test_reload_association_with_query_cache
     odegy_id = companies(:odegy).id
 
-    connection = ActiveRecord::Base.connection
+    connection = ActiveRecord::Base.lease_connection
     connection.enable_query_cache!
     connection.clear_query_cache
 
@@ -370,12 +397,25 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
     assert_equal 2, connection.query_cache.size
 
     # Clear the cache and fetch the account again, populating the cache with a query
-    assert_queries(1) { odegy.reload_account }
+    assert_queries_count(1) { odegy.reload_account }
 
     # This query is not cached anymore, so it should make a real SQL query
-    assert_queries(1) { Company.find(odegy_id) }
+    assert_queries_count(1) { Company.find(odegy_id) }
   ensure
-    ActiveRecord::Base.connection.disable_query_cache!
+    ActiveRecord::Base.lease_connection.disable_query_cache!
+  end
+
+  def test_reset_association
+    odegy = companies(:odegy)
+
+    assert_equal 53, odegy.account.credit_limit
+    Account.where(id: odegy.account.id).update_all(credit_limit: 80)
+    assert_equal 53, odegy.account.credit_limit
+
+    assert_no_queries { odegy.reset_account }
+
+    assert_queries_count(1) { odegy.account }
+    assert_equal 80, odegy.account.credit_limit
   end
 
   def test_build
@@ -488,10 +528,10 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
 
   def test_attributes_are_being_set_when_initialized_from_has_one_association_with_where_clause
     new_account = companies(:first_firm).build_account(firm_name: "Account")
-    assert_equal new_account.firm_name, "Account"
+    assert_equal "Account", new_account.firm_name
   end
 
-  def test_creation_failure_without_dependent_option
+  def test_creation_failure_replaces_existing_without_dependent_option
     pirate = pirates(:blackbeard)
     orig_ship = pirate.ship
 
@@ -500,16 +540,18 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
     assert_not_equal ships(:black_pearl), new_ship
     assert_equal new_ship, pirate.ship
     assert_predicate new_ship, :new_record?
+    assert_predicate new_ship, :invalid?
     assert_nil orig_ship.pirate_id
     assert_not orig_ship.changed? # check it was saved
   end
 
-  def test_creation_failure_with_dependent_option
+  def test_creation_failure_replaces_existing_with_dependent_option
     pirate = pirates(:blackbeard).becomes(DestructivePirate)
     orig_ship = pirate.dependent_ship
 
     new_ship = pirate.create_dependent_ship
     assert_predicate new_ship, :new_record?
+    assert_predicate new_ship, :invalid?
     assert_predicate orig_ship, :destroyed?
   end
 
@@ -522,6 +564,7 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
     end
 
     assert_equal "Failed to save the new associated ship.", error.message
+    assert_equal new_ship, error.record
     assert_nil pirate.ship
     assert_nil new_ship.pirate_id
   end
@@ -539,6 +582,7 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
     assert_equal pirate.id, pirate.ship.pirate_id
     assert_equal "Failed to remove the existing associated ship. " \
                  "The record failed to save after its foreign key was set to nil.", error.message
+    assert_equal pirate.ship, error.record
   end
 
   def test_replacement_failure_due_to_new_record_should_raise_error
@@ -550,6 +594,7 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
     end
 
     assert_equal "Failed to save the new associated ship.", error.message
+    assert_equal new_ship, error.record
     assert_equal ships(:black_pearl), pirate.ship
     assert_equal pirate.id, pirate.ship.pirate_id
     assert_equal pirate.id, ships(:black_pearl).reload.pirate_id
@@ -626,7 +671,7 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
     company.account = nil
     assert_no_queries { company.account = nil }
     account = Account.find(2)
-    assert_queries { company.account = account }
+    assert_queries_count(3) { company.account = account }
 
     assert_no_queries { Firm.new.account = account }
   end
@@ -638,7 +683,7 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
 
     ship.name = "new name"
     assert_predicate ship, :changed?
-    assert_queries(1) do
+    assert_queries_count(3) do
       # One query for updating name, not triggering query for updating pirate_id
       pirate.ship = ship
     end
@@ -652,7 +697,7 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
     ship.save!
 
     new_ship = Ship.create(name: "new name")
-    assert_queries(2) do
+    assert_queries_count(4) do
       # One query to nullify the old ship, one query to update the new ship
       pirate.ship = new_ship
     end
@@ -694,6 +739,7 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
     post.reload
 
     assert_equal image, post.main_image
+    assert_equal post, image.imageable
   end
 
   test "dangerous association name raises ArgumentError" do
@@ -707,8 +753,26 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
   end
 
   def test_has_one_with_touch_option_on_create
-    assert_queries(3) {
-      Club.create(name: "1000 Oaks", membership_attributes: { favourite: true })
+    assert_queries_count(5) {
+      Club.create(name: "1000 Oaks", membership_attributes: { favorite: true })
+    }
+  end
+
+  def test_polymorphic_has_one_with_touch_option_on_create_wont_cache_association_so_fetching_after_transaction_commit_works
+    assert_queries_count(6) {
+      chef = Chef.create(employable: DrinkDesignerWithPolymorphicTouchChef.new)
+      employable = chef.employable
+
+      assert_equal chef, employable.chef
+    }
+  end
+
+  def test_polymorphic_has_one_with_touch_option_on_update_will_touch_record_by_fetching_from_database_if_needed
+    DrinkDesignerWithPolymorphicTouchChef.create(chef: Chef.new)
+    designer = DrinkDesignerWithPolymorphicTouchChef.last
+
+    assert_queries_count(5) {
+      designer.update(name: "foo")
     }
   end
 
@@ -716,21 +780,21 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
     new_club = Club.create(name: "1000 Oaks")
     new_club.create_membership
 
-    assert_queries(2) { new_club.update(name: "Effingut") }
+    assert_queries_count(4) { new_club.update(name: "Effingut") }
   end
 
   def test_has_one_with_touch_option_on_touch
     new_club = Club.create(name: "1000 Oaks")
     new_club.create_membership
 
-    assert_queries(1) { new_club.touch }
+    assert_queries_count(3) { new_club.touch }
   end
 
   def test_has_one_with_touch_option_on_destroy
     new_club = Club.create(name: "1000 Oaks")
     new_club.create_membership
 
-    assert_queries(2) { new_club.destroy }
+    assert_queries_count(4) { new_club.destroy }
   end
 
   def test_has_one_with_touch_option_on_empty_update
@@ -743,9 +807,9 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
   class SpecialBook < ActiveRecord::Base
     self.table_name = "books"
     belongs_to :author, class_name: "SpecialAuthor"
-    has_one :subscription, class_name: "SpecialSupscription", foreign_key: "subscriber_id"
+    has_one :subscription, class_name: "SpecialSubscription", foreign_key: "subscriber_id"
 
-    enum status: [:proposed, :written, :published]
+    enum :status, [:proposed, :written, :published]
   end
 
   class SpecialAuthor < ActiveRecord::Base
@@ -753,7 +817,7 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
     has_one :book, class_name: "SpecialBook", foreign_key: "author_id"
   end
 
-  class SpecialSupscription < ActiveRecord::Base
+  class SpecialSubscription < ActiveRecord::Base
     self.table_name = "subscriptions"
     belongs_to :book, class_name: "SpecialBook"
   end
@@ -834,5 +898,46 @@ class HasOneAssociationsTest < ActiveRecord::TestCase
     assert_no_difference ["DestroyableAuthor.count", "UndestroyableBook.count"] do
       assert_not author.destroy
     end
+  end
+
+  class SpecialCar < ActiveRecord::Base
+    self.table_name = "cars"
+    has_one :special_bulb, inverse_of: :car, dependent: :destroy, class_name: "SpecialBulb", foreign_key: "car_id"
+  end
+
+  class SpecialBulb < ActiveRecord::Base
+    self.table_name = "bulbs"
+    belongs_to :car, inverse_of: :special_bulb, touch: true, class_name: "SpecialCar"
+  end
+
+  def test_has_one_with_touch_option_on_nonpersisted_built_associations_doesnt_update_parent
+    car = SpecialCar.create(name: "honda")
+    assert_queries_count(1) do
+      car.build_special_bulb
+      car.build_special_bulb
+    end
+  end
+  test "composite primary key malformed association class" do
+    error = assert_raises(ActiveRecord::CompositePrimaryKeyMismatchError) do
+      order = Cpk::BrokenOrder.new(id: [1, 2], book: Cpk::Book.new(title: "Some book"))
+      order.save!
+    end
+
+    assert_equal(<<~MESSAGE.squish, error.message)
+      Association Cpk::BrokenOrder#book primary key ["shop_id", "status"]
+      doesn't match with foreign key broken_order_id. Please specify query_constraints, or primary_key and foreign_key values.
+    MESSAGE
+  end
+
+  test "composite primary key malformed association owner class" do
+    error = assert_raises(ActiveRecord::CompositePrimaryKeyMismatchError) do
+      order = Cpk::BrokenOrderWithNonCpkBooks.new(id: [1, 2], book: Cpk::NonCpkBook.new(title: "Some book"))
+      order.save!
+    end
+
+    assert_equal(<<~MESSAGE.squish, error.message)
+      Association Cpk::BrokenOrderWithNonCpkBooks#book primary key [\"shop_id\", \"status\"]
+      doesn't match with foreign key broken_order_with_non_cpk_books_id. Please specify query_constraints, or primary_key and foreign_key values.
+    MESSAGE
   end
 end

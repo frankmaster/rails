@@ -3,13 +3,33 @@
 module ActiveRecord
   module ConnectionAdapters
     module PostgreSQL
-      class SchemaCreation < AbstractAdapter::SchemaCreation # :nodoc:
+      class SchemaCreation < SchemaCreation # :nodoc:
         private
+          delegate :quoted_include_columns_for_index, to: :@conn
+
           def visit_AlterTable(o)
-            super << o.constraint_validations.map { |fk| visit_ValidateConstraint fk }.join(" ")
+            sql = super
+            sql << o.constraint_validations.map { |fk| visit_ValidateConstraint fk }.join(" ")
+            sql << o.exclusion_constraint_adds.map { |con| visit_AddExclusionConstraint con }.join(" ")
+            sql << o.exclusion_constraint_drops.map { |con| visit_DropExclusionConstraint con }.join(" ")
+            sql << o.unique_constraint_adds.map { |con| visit_AddUniqueConstraint con }.join(" ")
+            sql << o.unique_constraint_drops.map { |con| visit_DropUniqueConstraint con }.join(" ")
           end
 
           def visit_AddForeignKey(o)
+            super.dup.tap do |sql|
+              sql << " DEFERRABLE INITIALLY #{o.options[:deferrable].to_s.upcase}" if o.deferrable
+              sql << " NOT VALID" unless o.validate?
+            end
+          end
+
+          def visit_ForeignKeyDefinition(o)
+            super.dup.tap do |sql|
+              sql << " DEFERRABLE INITIALLY #{o.deferrable.to_s.upcase}" if o.deferrable
+            end
+          end
+
+          def visit_CheckConstraintDefinition(o)
             super.dup.tap { |sql| sql << " NOT VALID" unless o.validate? }
           end
 
@@ -17,9 +37,57 @@ module ActiveRecord
             "VALIDATE CONSTRAINT #{quote_column_name(name)}"
           end
 
+          def visit_ExclusionConstraintDefinition(o)
+            sql = ["CONSTRAINT"]
+            sql << quote_column_name(o.name)
+            sql << "EXCLUDE"
+            sql << "USING #{o.using}" if o.using
+            sql << "(#{o.expression})"
+            sql << "WHERE (#{o.where})" if o.where
+            sql << "DEFERRABLE INITIALLY #{o.deferrable.to_s.upcase}" if o.deferrable
+
+            sql.join(" ")
+          end
+
+          def visit_UniqueConstraintDefinition(o)
+            column_name = Array(o.column).map { |column| quote_column_name(column) }.join(", ")
+
+            sql = ["CONSTRAINT"]
+            sql << quote_column_name(o.name)
+            sql << "UNIQUE"
+
+            if o.using_index
+              sql << "USING INDEX #{quote_column_name(o.using_index)}"
+            else
+              sql << "(#{column_name})"
+            end
+
+            if o.deferrable
+              sql << "DEFERRABLE INITIALLY #{o.deferrable.to_s.upcase}"
+            end
+
+            sql.join(" ")
+          end
+
+          def visit_AddExclusionConstraint(o)
+            "ADD #{accept(o)}"
+          end
+
+          def visit_DropExclusionConstraint(name)
+            "DROP CONSTRAINT #{quote_column_name(name)}"
+          end
+
+          def visit_AddUniqueConstraint(o)
+            "ADD #{accept(o)}"
+          end
+
+          def visit_DropUniqueConstraint(name)
+            "DROP CONSTRAINT #{quote_column_name(name)}"
+          end
+
           def visit_ChangeColumnDefinition(o)
             column = o.column
-            column.sql_type = type_to_sql(column.type, column.options)
+            column.sql_type = type_to_sql(column.type, **column.options)
             quoted_column_name = quote_column_name(o.name)
 
             change_column_sql = +"ALTER COLUMN #{quoted_column_name} TYPE #{column.sql_type}"
@@ -33,7 +101,7 @@ module ActiveRecord
             if options[:using]
               change_column_sql << " USING #{options[:using]}"
             elsif options[:cast_as]
-              cast_as_type = type_to_sql(options[:cast_as], options)
+              cast_as_type = type_to_sql(options[:cast_as], **options)
               change_column_sql << " USING CAST(#{quoted_column_name} AS #{cast_as_type})"
             end
 
@@ -53,11 +121,37 @@ module ActiveRecord
             change_column_sql
           end
 
+          def visit_ChangeColumnDefaultDefinition(o)
+            sql = +"ALTER COLUMN #{quote_column_name(o.column.name)} "
+            if o.default.nil?
+              sql << "DROP DEFAULT"
+            else
+              sql << "SET DEFAULT #{quote_default_expression(o.default, o.column)}"
+            end
+          end
+
           def add_column_options!(sql, options)
             if options[:collation]
               sql << " COLLATE \"#{options[:collation]}\""
             end
+
+            if as = options[:as]
+              sql << " GENERATED ALWAYS AS (#{as})"
+
+              if options[:stored]
+                sql << " STORED"
+              else
+                raise ArgumentError, <<~MSG
+                  PostgreSQL currently does not support VIRTUAL (not persisted) generated columns.
+                  Specify 'stored: true' option for '#{options[:column].name}'
+                MSG
+              end
+            end
             super
+          end
+
+          def quoted_include_columns(o)
+            String === o ? o : quoted_include_columns_for_index(o)
           end
 
           # Returns any SQL string to go between CREATE and TABLE. May be nil.

@@ -13,6 +13,8 @@ class CookieStoreTest < ActionDispatch::IntegrationTest
   Generator = ActiveSupport::KeyGenerator.new(SessionSecret, iterations: 1000)
   Rotations = ActiveSupport::Messages::RotationConfiguration.new
 
+  SameSite = proc { :lax }
+
   Encryptor = ActiveSupport::MessageEncryptor.new(
     Generator.generate_key(SessionSalt, 32), cipher: "aes-256-gcm", serializer: Marshal
   )
@@ -36,7 +38,7 @@ class CookieStoreTest < ActionDispatch::IntegrationTest
     end
 
     def get_session_id
-      render plain: "id: #{request.session.id}"
+      render plain: "id: #{request.session.id&.public_id}"
     end
 
     def get_class_after_reset_session
@@ -70,16 +72,23 @@ class CookieStoreTest < ActionDispatch::IntegrationTest
     end
   end
 
-  def parse_cookie_from_header
-    cookie_matches = headers["Set-Cookie"].match(/#{SessionKey}=([^;]+)/)
-    cookie_matches && cookie_matches[1]
-  end
+  include CookieAssertions
 
-  def assert_session_cookie(cookie_string, contents)
-    assert_includes headers["Set-Cookie"], cookie_string
+  def assert_session_cookie(attributes_string, contents)
+    cookies = parse_set_cookies_headers(headers["Set-Cookie"])
 
-    session_value = parse_cookie_from_header
-    session_data = Encryptor.decrypt_and_verify(Rack::Utils.unescape(session_value)) rescue nil
+    if session_cookie = cookies[SessionKey]
+      if attributes_string
+        expected_attributes = parse_set_cookie_attributes(attributes_string)
+
+        expected_attributes.each do |key, value|
+          assert_equal value, session_cookie[key], "expected #{key} to be #{value.inspect}, but was #{session_cookie[key].inspect}"
+        end
+      end
+
+      session_value = session_cookie[:value]
+      session_data = Encryptor.decrypt_and_verify(Rack::Utils.unescape(session_value)) rescue nil
+    end
 
     assert_not_nil session_data, "session failed to decrypt"
     assert_equal session_data.slice(*contents.keys), contents
@@ -90,7 +99,7 @@ class CookieStoreTest < ActionDispatch::IntegrationTest
       get "/set_session_value"
 
       assert_response :success
-      assert_session_cookie "path=/; HttpOnly", "foo" => "bar"
+      assert_session_cookie "path=/; HttpOnly", { "foo" => "bar" }
     end
   end
 
@@ -123,7 +132,7 @@ class CookieStoreTest < ActionDispatch::IntegrationTest
     with_test_route_set do
       encryptor = ActiveSupport::MessageEncryptor.new("A" * 32, cipher: "aes-256-gcm", serializer: Marshal)
 
-      cookies[SessionKey] = encryptor.encrypt_and_sign("foo" => "bar", "session_id" => "abc")
+      cookies[SessionKey] = encryptor.encrypt_and_sign({ "foo" => "bar", "session_id" => "abc" })
 
       get "/get_session_value"
 
@@ -133,7 +142,9 @@ class CookieStoreTest < ActionDispatch::IntegrationTest
   end
 
   def test_does_not_set_secure_cookies_over_http
-    with_test_route_set(secure: true) do
+    cookie_options(secure: true)
+
+    with_test_route_set do
       get "/set_session_value"
       assert_response :success
       assert_nil headers["Set-Cookie"]
@@ -152,7 +163,9 @@ class CookieStoreTest < ActionDispatch::IntegrationTest
   end
 
   def test_does_set_secure_cookies_over_https
-    with_test_route_set(secure: true) do
+    cookie_options(secure: true)
+
+    with_test_route_set do
       get "/set_session_value", headers: { "HTTPS" => "on" }
 
       assert_response :success
@@ -187,9 +200,10 @@ class CookieStoreTest < ActionDispatch::IntegrationTest
 
   def test_close_raises_when_data_overflows
     with_test_route_set do
-      assert_raise(ActionDispatch::Cookies::CookieOverflow) {
+      error = assert_raise(ActionDispatch::Cookies::CookieOverflow) {
         get "/raise_data_overflow"
       }
+      assert_equal "_myapp_session cookie overflowed with size 5612 bytes", error.message
     end
   end
 
@@ -221,6 +235,7 @@ class CookieStoreTest < ActionDispatch::IntegrationTest
       get "/call_reset_session"
       assert_response :success
       assert_not_equal [], headers["Set-Cookie"]
+      assert_not_nil headers["Set-Cookie"]
       assert_not_nil session_payload
       assert_not_equal session_payload, cookies[SessionKey]
 
@@ -295,12 +310,14 @@ class CookieStoreTest < ActionDispatch::IntegrationTest
   end
 
   def test_session_store_with_expire_after
-    with_test_route_set(expire_after: 5.hours) do
+    cookie_options(expire_after: 5.hours)
+
+    with_test_route_set do
       # First request accesses the session
       time = Time.local(2008, 4, 24)
 
       Time.stub :now, time do
-        expected_expiry = (time + 5.hours).gmtime.strftime("%a, %d %b %Y %H:%M:%S -0000")
+        expected_expiry = (time + 5.hours).gmtime.strftime("%a, %d %b %Y %H:%M:%S GMT")
 
         get "/set_session_value"
 
@@ -311,7 +328,7 @@ class CookieStoreTest < ActionDispatch::IntegrationTest
       # Second request does not access the session
       time = time + 3.hours
       Time.stub :now, time do
-        expected_expiry = (time + 5.hours).gmtime.strftime("%a, %d %b %Y %H:%M:%S -0000")
+        expected_expiry = (time + 5.hours).gmtime.strftime("%a, %d %b %Y %H:%M:%S GMT")
 
         get "/no_session_access"
 
@@ -322,12 +339,14 @@ class CookieStoreTest < ActionDispatch::IntegrationTest
   end
 
   def test_session_store_with_expire_after_does_not_accept_expired_session
-    with_test_route_set(expire_after: 5.hours) do
+    cookie_options(expire_after: 5.hours)
+
+    with_test_route_set do
       # First request accesses the session
       time = Time.local(2017, 11, 12)
 
       Time.stub :now, time do
-        expected_expiry = (time + 5.hours).gmtime.strftime("%a, %d %b %Y %H:%M:%S -0000")
+        expected_expiry = (time + 5.hours).gmtime.strftime("%a, %d %b %Y %H:%M:%S GMT")
 
         get "/set_session_value"
         get "/get_session_value"
@@ -350,7 +369,9 @@ class CookieStoreTest < ActionDispatch::IntegrationTest
   end
 
   def test_session_store_with_explicit_domain
-    with_test_route_set(domain: "example.es") do
+    cookie_options(domain: "example.es")
+
+    with_test_route_set do
       get "/set_session_value"
       assert_match(/domain=example\.es/, headers["Set-Cookie"])
       headers["Set-Cookie"]
@@ -360,54 +381,88 @@ class CookieStoreTest < ActionDispatch::IntegrationTest
   def test_session_store_without_domain
     with_test_route_set do
       get "/set_session_value"
-      assert_no_match(/domain\=/, headers["Set-Cookie"])
+      assert_no_match(/domain=/, headers["Set-Cookie"])
     end
   end
 
   def test_session_store_with_nil_domain
-    with_test_route_set(domain: nil) do
+    cookie_options(domain: nil)
+
+    with_test_route_set do
       get "/set_session_value"
-      assert_no_match(/domain\=/, headers["Set-Cookie"])
+      assert_no_match(/domain=/, headers["Set-Cookie"])
     end
   end
 
   def test_session_store_with_all_domains
-    with_test_route_set(domain: :all) do
+    cookie_options(domain: :all)
+
+    with_test_route_set do
       get "/set_session_value"
-      assert_match(/domain=\.example\.com/, headers["Set-Cookie"])
+      assert_match(/domain=example\.com/, headers["Set-Cookie"])
+    end
+  end
+
+  test "default same_site derives SameSite from env" do
+    with_test_route_set do
+      get "/set_session_value"
+      assert_set_cookie_attributes("_myapp_session", "SameSite=Lax")
+    end
+  end
+
+  test "explicit same_site sets SameSite" do
+    cookie_options(same_site: :strict)
+
+    with_test_route_set do
+      get "/set_session_value"
+      assert_set_cookie_attributes("_myapp_session", "SameSite=Strict")
+    end
+  end
+
+  test "explicit nil same_site omits SameSite" do
+    cookie_options(same_site: nil)
+
+    with_test_route_set do
+      get "/set_session_value"
+      assert_not_set_cookie_attributes("_myapp_session", "SameSite")
     end
   end
 
   private
-    # Overwrite get to send SessionSecret in env hash
-    def get(path, *args)
-      args[0] ||= {}
-      args[0][:headers] ||= {}
-      args[0][:headers].tap do |config|
+    # Overwrite `get` to set env hash
+    def get(path, **options)
+      options[:headers] ||= {}
+      options[:headers].tap do |config|
         config["action_dispatch.secret_key_base"] = SessionSecret
         config["action_dispatch.authenticated_encrypted_cookie_salt"] = SessionSalt
         config["action_dispatch.use_authenticated_cookie_encryption"] = true
 
         config["action_dispatch.key_generator"] ||= Generator
         config["action_dispatch.cookies_rotations"] ||= Rotations
+
+        config["action_dispatch.cookies_same_site_protection"] ||= SameSite
       end
 
-      super(path, *args)
+      super
     end
 
-    def with_test_route_set(options = {})
+    def cookie_options(options = {})
+      (@cookie_options ||= { key: SessionKey }).merge!(options)
+    end
+
+    def app
+      @app ||= self.class.build_app do |middleware|
+        middleware.use ActionDispatch::Session::CookieStore, cookie_options
+        middleware.delete ActionDispatch::ShowExceptions
+      end
+    end
+
+    def with_test_route_set
       with_routing do |set|
         set.draw do
-          ActiveSupport::Deprecation.silence do
+          ActionDispatch.deprecator.silence do
             get ":action", to: ::CookieStoreTest::TestController
           end
-        end
-
-        options = { key: SessionKey }.merge!(options)
-
-        @app = self.class.build_app(set) do |middleware|
-          middleware.use ActionDispatch::Session::CookieStore, options
-          middleware.delete ActionDispatch::ShowExceptions
         end
 
         yield

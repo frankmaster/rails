@@ -80,6 +80,18 @@ class MimeTypeTest < ActiveSupport::TestCase
     assert_equal expect, Mime::Type.parse(accept)
   end
 
+  test "parse arbitrary media type parameters with comma" do
+    accept = 'multipart/form-data; boundary="simple, boundary"'
+    expect = [Mime[:multipart_form]]
+    assert_equal expect, Mime::Type.parse(accept)
+  end
+
+  test "parse arbitrary media type parameters with comma and additional media type" do
+    accept = 'multipart/form-data; boundary="simple, boundary", text/xml'
+    expect = [Mime[:multipart_form], Mime[:xml]]
+    assert_equal expect, Mime::Type.parse(accept)
+  end
+
   # Accept header send with user HTTP_USER_AGENT: Sunrise/0.42j (Windows XP)
   test "parse broken acceptlines" do
     accept = "text/xml,application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/*,,*/*;q=0.5"
@@ -111,6 +123,15 @@ class MimeTypeTest < ActiveSupport::TestCase
     Mime::Type.unregister(:foobar)
   end
 
+  test "custom type with url parameter" do
+    accept = 'application/vnd.api+json; profile="https://jsonapi.org/profiles/example"'
+    type = Mime::Type.register(accept, :example_api)
+    assert_equal type, Mime[:example_api]
+    assert_equal [type], Mime::Type.parse(accept)
+  ensure
+    Mime::Type.unregister(:example_api)
+  end
+
   test "register callbacks" do
     registered_mimes = []
     Mime::Type.register_callback do |mime|
@@ -140,8 +161,8 @@ class MimeTypeTest < ActiveSupport::TestCase
   end
 
   test "type should be equal to symbol" do
-    assert_equal Mime[:html], "application/xhtml+xml"
-    assert_equal Mime[:html], :html
+    assert_operator Mime[:html], :==, "application/xhtml+xml"
+    assert_operator Mime[:html], :==, :html
   end
 
   test "type convenience methods" do
@@ -175,6 +196,12 @@ class MimeTypeTest < ActiveSupport::TestCase
     assert Mime[:html] =~ "application/xhtml+xml"
   end
 
+  test "match?" do
+    assert Mime[:js].match?("text/javascript")
+    assert Mime[:js].match?("application/javascript")
+    assert_not Mime[:js].match?("text/html")
+  end
+
   test "can be initialized with wildcards" do
     assert_equal "*/*", Mime::Type.new("*/*").to_s
     assert_equal "text/*", Mime::Type.new("text/*").to_s
@@ -186,6 +213,11 @@ class MimeTypeTest < ActiveSupport::TestCase
     assert_equal "text/html; parameter=abc", Mime::Type.new("text/html; parameter=abc").to_s
     assert_equal 'text/html; parameter="abc"', Mime::Type.new('text/html; parameter="abc"').to_s
     assert_equal 'text/html; parameter=abc; parameter2="xyz"', Mime::Type.new('text/html; parameter=abc; parameter2="xyz"').to_s
+  end
+
+  test "can be initialized with parameters without having space after ;" do
+    assert_equal "text/html;parameter", Mime::Type.new("text/html;parameter").to_s
+    assert_equal 'text/html;parameter=abc;parameter2="xyz"', Mime::Type.new('text/html;parameter=abc;parameter2="xyz"').to_s
   end
 
   test "invalid mime types raise error" do
@@ -220,5 +252,21 @@ class MimeTypeTest < ActiveSupport::TestCase
     assert_raises Mime::Type::InvalidMimeType do
       Mime::Type.new(nil)
     end
+
+    assert_raises Mime::Type::InvalidMimeType do
+      Timeout.timeout(1) do # Shouldn't take more than 1s
+        Mime::Type.new("text/html ;0 ;0 ;0 ;0 ;0 ;0 ;0 ;0 ;0 ;0 ;0 ;0 ;0 ;0 ;0 ;0 ;0 ;0;")
+      end
+    end
+  end
+
+  test "holds a reference to mime symbols" do
+    old_symbols = Mime::SET.symbols
+    Mime::Type.register_alias "application/xhtml+xml", :foobar
+    new_symbols = Mime::SET.symbols
+
+    assert_same(old_symbols, new_symbols)
+  ensure
+    Mime::Type.unregister(:foobar)
   end
 end

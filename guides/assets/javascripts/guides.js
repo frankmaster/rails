@@ -1,8 +1,6 @@
 (function() {
   "use strict";
 
-  this.syntaxhighlighterConfig = { autoLinks: false };
-
   this.wrap = function(elem, wrapper) {
     elem.parentNode.insertBefore(wrapper, elem);
     wrapper.appendChild(elem);
@@ -25,12 +23,7 @@
     for(var i = 0; i < array.length; i++) callback(array[i]);
   }
 
-  // Viewable on local
-  if (window.location.protocol === "file:") Turbolinks.supported = false;
-
-  document.addEventListener("turbolinks:load", function() {
-    window.SyntaxHighlighter.highlight({ "auto-links": false });
-
+  document.addEventListener("turbo:load", function() {
     var guidesMenu = document.getElementById("guidesMenu");
     var guides     = document.getElementById("guides");
 
@@ -45,16 +38,38 @@
       });
     });
 
+    document.addEventListener("keyup", function(e) {
+      if (e.key === "Escape" && guides.classList.contains("visible")) {
+        guides.classList.remove("visible");
+      }
+    });
+
+    var backToTop = createElement("a", "back-to-top");
+    backToTop.setAttribute("href", "#");
+
+    document.body.appendChild(backToTop);
+
+    backToTop.addEventListener("click", function(e) {
+      e.preventDefault();
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+
+    var toggleBackToTop = function() {
+      if (window.scrollY > 300) {
+        backToTop.classList.add("show");
+      } else {
+        backToTop.classList.remove("show");
+      }
+    }
+
+    document.addEventListener("scroll", toggleBackToTop);
+
     var guidesIndexItem   = document.querySelector("select.guides-index-item");
     var currentGuidePath  = window.location.pathname;
-    guidesIndexItem.value = currentGuidePath.substring(currentGuidePath.lastIndexOf("/") + 1);
+    guidesIndexItem.value = currentGuidePath.substring(currentGuidePath.lastIndexOf("/") + 1) || 'index.html';
 
     guidesIndexItem.addEventListener("change", function(e) {
-      if (Turbolinks.supported) {
-        Turbolinks.visit(e.target.value);
-      } else {
-        window.location = e.target.value;
-      }
+      Turbo.visit(e.target.value);
     });
 
     var moreInfoButton = document.querySelector(".more-info-button");
@@ -70,6 +85,17 @@
         moreInfoLinks.classList.add("s-hidden");
         unwrap(moreInfoLinks);
       }
+    });
+
+    var clipboard = new ClipboardJS('.clipboard-button');
+    clipboard.on('success', function(e) {
+      var trigger = e.trigger;
+      var triggerLabel = trigger.innerHTML;
+      trigger.innerHTML = 'Copied!';
+      setTimeout(function(){
+        trigger.innerHTML = triggerLabel;
+      }, 3000);
+      e.clearSelection();
     });
   });
 }).call(this);

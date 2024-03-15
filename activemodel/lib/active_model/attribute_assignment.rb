@@ -10,7 +10,7 @@ module ActiveModel
     # keys matching the attribute names.
     #
     # If the passed hash responds to <tt>permitted?</tt> method and the return value
-    # of this method is +false+ an <tt>ActiveModel::ForbiddenAttributesError</tt>
+    # of this method is +false+ an ActiveModel::ForbiddenAttributesError
     # exception is raised.
     #
     #   class Cat
@@ -26,13 +26,12 @@ module ActiveModel
     #   cat.name # => 'Gorby'
     #   cat.status # => 'sleeping'
     def assign_attributes(new_attributes)
-      if !new_attributes.respond_to?(:stringify_keys)
+      unless new_attributes.respond_to?(:each_pair)
         raise ArgumentError, "When assigning attributes, you must pass a hash as an argument, #{new_attributes.class} passed."
       end
       return if new_attributes.empty?
 
-      attributes = new_attributes.stringify_keys
-      _assign_attributes(sanitize_for_mass_assignment(attributes))
+      _assign_attributes(sanitize_for_mass_assignment(new_attributes))
     end
 
     alias attributes= assign_attributes
@@ -46,10 +45,12 @@ module ActiveModel
 
       def _assign_attribute(k, v)
         setter = :"#{k}="
+        public_send(setter, v)
+      rescue NoMethodError
         if respond_to?(setter)
-          public_send(setter, v)
+          raise
         else
-          raise UnknownAttributeError.new(self, k)
+          raise UnknownAttributeError.new(self, k.to_s)
         end
       end
   end

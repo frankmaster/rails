@@ -1,16 +1,11 @@
 # frozen_string_literal: true
 
 require "active_support/concern"
-require "active_support/core_ext/module/attribute_accessors"
-require "concurrent"
+require "logger"
 
 module ActiveSupport
   module LoggerThreadSafeLevel # :nodoc:
     extend ActiveSupport::Concern
-
-    included do
-      cattr_accessor :local_levels, default: Concurrent::Map.new(initial_capacity: 2), instance_accessor: false
-    end
 
     Logger::Severity.constants.each do |severity|
       class_eval(<<-EOT, __FILE__, __LINE__ + 1)
@@ -20,26 +15,23 @@ module ActiveSupport
       EOT
     end
 
-    def after_initialize
-      ActiveSupport::Deprecation.warn(
-        "Logger don't need to call #after_initialize directly anymore. It will be deprecated without replacement in " \
-        "Rails 6.1."
-      )
-    end
-
-    def local_log_id
-      Thread.current.__id__
-    end
-
     def local_level
-      self.class.local_levels[local_log_id]
+      IsolatedExecutionState[local_level_key]
     end
 
     def local_level=(level)
-      if level
-        self.class.local_levels[local_log_id] = level
+      case level
+      when Integer
+      when Symbol
+        level = Logger::Severity.const_get(level.to_s.upcase)
+      when nil
       else
-        self.class.local_levels.delete(local_log_id)
+        raise ArgumentError, "Invalid log level: #{level.inspect}"
+      end
+      if level.nil?
+        IsolatedExecutionState.delete(local_level_key)
+      else
+        IsolatedExecutionState[local_level_key] = level
       end
     end
 
@@ -47,9 +39,17 @@ module ActiveSupport
       local_level || super
     end
 
-    def add(severity, message = nil, progname = nil, &block) # :nodoc:
-      return true if @logdev.nil? || (severity || UNKNOWN) < level
-      super
+    # Change the thread-local level for the duration of the given block.
+    def log_at(level)
+      old_local_level, self.local_level = local_level, level
+      yield
+    ensure
+      self.local_level = old_local_level
     end
+
+    private
+      def local_level_key
+        @local_level_key ||= :"logger_thread_safe_level_#{object_id}"
+      end
   end
 end

@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "bigdecimal"
 require "active_support/core_ext/hash"
 
 module ActiveJob
@@ -7,7 +8,7 @@ module ActiveJob
   #
   # Wraps the original exception raised as +cause+.
   class DeserializationError < StandardError
-    def initialize #:nodoc:
+    def initialize # :nodoc:
       super("Error while trying to deserialize arguments: #{$!.message}")
       set_backtrace $!.backtrace
     end
@@ -17,8 +18,8 @@ module ActiveJob
   # currently support String, Integer, Float, NilClass, TrueClass, FalseClass,
   # BigDecimal, Symbol, Date, Time, DateTime, ActiveSupport::TimeWithZone,
   # ActiveSupport::Duration, Hash, ActiveSupport::HashWithIndifferentAccess,
-  # Array or GlobalID::Identification instances, although this can be extended
-  # by adding custom serializers.
+  # Array, Range, or GlobalID::Identification instances, although this can be
+  # extended by adding custom serializers.
   # Raised if you set the key for a Hash something else than a string or
   # a symbol. Also raised when trying to serialize an object which can't be
   # identified with a GlobalID - such as an unpersisted Active Record model.
@@ -46,11 +47,11 @@ module ActiveJob
 
     private
       # :nodoc:
-      PERMITTED_TYPES = [ NilClass, String, Integer, Float, BigDecimal, TrueClass, FalseClass ]
-      # :nodoc:
       GLOBALID_KEY = "_aj_globalid"
       # :nodoc:
       SYMBOL_KEYS_KEY = "_aj_symbol_keys"
+      # :nodoc:
+      RUBY2_KEYWORDS_KEY = "_aj_ruby2_keywords"
       # :nodoc:
       WITH_INDIFFERENT_ACCESS_KEY = "_aj_hash_with_indifferent_access"
       # :nodoc:
@@ -60,15 +61,27 @@ module ActiveJob
       RESERVED_KEYS = [
         GLOBALID_KEY, GLOBALID_KEY.to_sym,
         SYMBOL_KEYS_KEY, SYMBOL_KEYS_KEY.to_sym,
+        RUBY2_KEYWORDS_KEY, RUBY2_KEYWORDS_KEY.to_sym,
         OBJECT_SERIALIZER_KEY, OBJECT_SERIALIZER_KEY.to_sym,
         WITH_INDIFFERENT_ACCESS_KEY, WITH_INDIFFERENT_ACCESS_KEY.to_sym,
       ]
-      private_constant :PERMITTED_TYPES, :RESERVED_KEYS, :GLOBALID_KEY, :SYMBOL_KEYS_KEY, :WITH_INDIFFERENT_ACCESS_KEY
+      private_constant :RESERVED_KEYS, :GLOBALID_KEY,
+        :SYMBOL_KEYS_KEY, :RUBY2_KEYWORDS_KEY, :WITH_INDIFFERENT_ACCESS_KEY
 
       def serialize_argument(argument)
         case argument
-        when *PERMITTED_TYPES
+        when nil, true, false, Integer, Float # Types that can hardly be subclassed
           argument
+        when String
+          if argument.class == String
+            argument
+          else
+            begin
+              Serializers.serialize(argument)
+            rescue SerializationError
+              argument
+            end
+          end
         when GlobalID::Identification
           convert_to_global_id_hash(argument)
         when Array
@@ -76,22 +89,27 @@ module ActiveJob
         when ActiveSupport::HashWithIndifferentAccess
           serialize_indifferent_hash(argument)
         when Hash
-          symbol_keys = argument.each_key.grep(Symbol).map(&:to_s)
+          symbol_keys = argument.each_key.grep(Symbol).map!(&:to_s)
+          aj_hash_key = if Hash.ruby2_keywords_hash?(argument)
+            RUBY2_KEYWORDS_KEY
+          else
+            SYMBOL_KEYS_KEY
+          end
           result = serialize_hash(argument)
-          result[SYMBOL_KEYS_KEY] = symbol_keys
+          result[aj_hash_key] = symbol_keys
           result
-        when -> (arg) { arg.respond_to?(:permitted?) }
-          serialize_indifferent_hash(argument.to_h)
         else
-          Serializers.serialize(argument)
+          if argument.respond_to?(:permitted?) && argument.respond_to?(:to_h)
+            serialize_indifferent_hash(argument.to_h)
+          else
+            Serializers.serialize(argument)
+          end
         end
       end
 
       def deserialize_argument(argument)
         case argument
-        when String
-          argument
-        when *PERMITTED_TYPES
+        when nil, true, false, String, Integer, Float
           argument
         when Array
           argument.map { |arg| deserialize_argument(arg) }
@@ -132,6 +150,9 @@ module ActiveJob
           result = result.with_indifferent_access
         elsif symbol_keys = result.delete(SYMBOL_KEYS_KEY)
           result = transform_symbol_keys(result, symbol_keys)
+        elsif symbol_keys = result.delete(RUBY2_KEYWORDS_KEY)
+          result = transform_symbol_keys(result, symbol_keys)
+          result = Hash.ruby2_keywords_hash(result)
         end
         result
       end

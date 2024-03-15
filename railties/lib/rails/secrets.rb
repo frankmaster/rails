@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "yaml"
+require "tempfile"
 require "active_support/message_encryptor"
 
 module Rails
@@ -25,7 +26,10 @@ module Rails
         paths.each_with_object(Hash.new) do |path, all_secrets|
           require "erb"
 
-          secrets = YAML.load(ERB.new(preprocess(path)).result) || {}
+          source = ERB.new(preprocess(path)).result
+          secrets = YAML.respond_to?(:unsafe_load) ? YAML.unsafe_load(source) : YAML.load(source)
+          secrets ||= {}
+
           all_secrets.merge!(secrets["shared"].deep_symbolize_keys) if secrets["shared"]
           all_secrets.merge!(secrets[env].deep_symbolize_keys) if secrets[env]
         end
@@ -84,17 +88,18 @@ module Rails
         end
 
         def writing(contents)
-          tmp_file = "#{File.basename(path)}.#{Process.pid}"
-          tmp_path = File.join(Dir.tmpdir, tmp_file)
-          IO.binwrite(tmp_path, contents)
+          file_name = "#{File.basename(path)}.#{Process.pid}"
 
-          yield tmp_path
+          Tempfile.create(["", "-" + file_name]) do |tmp_file|
+            tmp_path = Pathname.new(tmp_file)
+            tmp_path.binwrite contents
 
-          updated_contents = IO.binread(tmp_path)
+            yield tmp_path
 
-          write(updated_contents) if updated_contents != contents
-        ensure
-          FileUtils.rm(tmp_path) if File.exist?(tmp_path)
+            updated_contents = tmp_path.binread
+
+            write(updated_contents) if updated_contents != contents
+          end
         end
 
         def encryptor

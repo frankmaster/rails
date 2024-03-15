@@ -4,7 +4,7 @@ module Rails
   module Generators
     module Database # :nodoc:
       JDBC_DATABASES = %w( jdbcmysql jdbcsqlite3 jdbcpostgresql jdbc )
-      DATABASES = %w( mysql postgresql sqlite3 oracle frontbase ibm_db sqlserver ) + JDBC_DATABASES
+      DATABASES = %w( mysql trilogy postgresql sqlite3 oracle sqlserver ) + JDBC_DATABASES
 
       def initialize(*)
         super
@@ -13,17 +13,37 @@ module Rails
 
       def gem_for_database(database = options[:database])
         case database
-        when "mysql"          then ["mysql2", [">= 0.4.4"]]
-        when "postgresql"     then ["pg", [">= 0.18", "< 2.0"]]
+        when "mysql"          then ["mysql2", ["~> 0.5"]]
+        when "trilogy"        then ["trilogy", ["~> 2.7"]]
+        when "postgresql"     then ["pg", ["~> 1.1"]]
         when "sqlite3"        then ["sqlite3", ["~> 1.4"]]
         when "oracle"         then ["activerecord-oracle_enhanced-adapter", nil]
-        when "frontbase"      then ["ruby-frontbase", nil]
         when "sqlserver"      then ["activerecord-sqlserver-adapter", nil]
         when "jdbcmysql"      then ["activerecord-jdbcmysql-adapter", nil]
         when "jdbcsqlite3"    then ["activerecord-jdbcsqlite3-adapter", nil]
         when "jdbcpostgresql" then ["activerecord-jdbcpostgresql-adapter", nil]
         when "jdbc"           then ["activerecord-jdbc-adapter", nil]
         else [database, nil]
+        end
+      end
+
+      def docker_for_database_base(database = options[:database])
+        case database
+        when "mysql"          then "curl default-mysql-client libvips"
+        when "trilogy"        then "curl libvips"
+        when "postgresql"     then "curl libvips postgresql-client"
+        when "sqlite3"        then "curl libsqlite3-0 libvips"
+        else nil
+        end
+      end
+
+      def docker_for_database_build(database = options[:database])
+        case database
+        when "mysql"          then "build-essential default-libmysqlclient-dev git"
+        when "trilogy"        then "build-essential git"
+        when "postgresql"     then "build-essential git libpq-dev"
+        when "sqlite3"        then "build-essential git"
+        else nil
         end
       end
 
@@ -36,6 +56,23 @@ module Rails
           when "sqlite3"    then opt[:database] = "jdbcsqlite3"
           end
           self.options = opt.freeze
+        end
+      end
+
+      def base_package_for_database(database = options[:database])
+        case database
+        when "mysql" then "default-mysql-client"
+        when "postgresql" then "postgresql-client"
+        when "sqlite3" then "libsqlite3-0"
+        else nil
+        end
+      end
+
+      def build_package_for_database(database = options[:database])
+        case database
+        when "mysql" then "default-libmysqlclient-dev"
+        when "postgresql" then "libpq-dev"
+        else nil
         end
       end
 
@@ -52,6 +89,14 @@ module Rails
             "/opt/local/var/run/mysql5/mysqld.sock",  # mac + darwinports + mysql5
             "/opt/lampp/var/mysql/mysql.sock"         # xampp for linux
           ].find { |f| File.exist?(f) } unless Gem.win_platform?
+        end
+
+        def mysql_database_host
+          if options[:skip_devcontainer]
+            "localhost"
+          else
+            "<%= ENV.fetch(\"DB_HOST\") { \"localhost\" } %>"
+          end
         end
     end
   end

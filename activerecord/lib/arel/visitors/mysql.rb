@@ -5,8 +5,9 @@ module Arel # :nodoc: all
     class MySQL < Arel::Visitors::ToSql
       private
         def visit_Arel_Nodes_Bin(o, collector)
-          collector << "BINARY "
+          collector << "CAST("
           visit o.expr, collector
+          collector << " AS BINARY)"
         end
 
         def visit_Arel_Nodes_UnqualifiedColumn(o, collector)
@@ -15,7 +16,9 @@ module Arel # :nodoc: all
 
         ###
         # :'(
-        # http://dev.mysql.com/doc/refman/5.0/en/select.html#id3482214
+        # To retrieve all rows from a certain offset up to the end of the result set,
+        # you can use some large number for the second parameter.
+        # https://dev.mysql.com/doc/refman/en/select.html
         def visit_Arel_Nodes_SelectStatement(o, collector)
           if o.offset && !o.limit
             o.limit = Arel::Nodes::Limit.new(18446744073709551615)
@@ -48,11 +51,36 @@ module Arel # :nodoc: all
           visit_Arel_Nodes_IsNotDistinctFrom o, collector
         end
 
+        def visit_Arel_Nodes_Regexp(o, collector)
+          infix_value o, collector, " REGEXP "
+        end
+
+        def visit_Arel_Nodes_NotRegexp(o, collector)
+          infix_value o, collector, " NOT REGEXP "
+        end
+
+        def visit_Arel_Nodes_NullsFirst(o, collector)
+          visit(o.expr.expr, collector) << " IS NOT NULL, "
+          visit(o.expr, collector)
+        end
+
+        def visit_Arel_Nodes_NullsLast(o, collector)
+          visit(o.expr.expr, collector) << " IS NULL, "
+          visit(o.expr, collector)
+        end
+
+        def visit_Arel_Nodes_Cte(o, collector)
+          collector << quote_table_name(o.name)
+          collector << " AS "
+          visit o.relation, collector
+        end
+
         # In the simple case, MySQL allows us to place JOINs directly into the UPDATE
         # query. However, this does not allow for LIMIT, OFFSET and ORDER. To support
         # these, we must use a subquery.
         def prepare_update_statement(o)
-          if o.offset || has_join_sources?(o) && has_limit_or_offset_or_orders?(o)
+          if o.offset || has_group_by_and_having?(o) ||
+            has_join_sources?(o) && has_limit_or_offset_or_orders?(o)
             super
           else
             o
@@ -60,7 +88,7 @@ module Arel # :nodoc: all
         end
         alias :prepare_delete_statement :prepare_update_statement
 
-        # MySQL is too stupid to create a temporary table for use subquery, so we have
+        # MySQL doesn't automatically create a temporary table for use subquery, so we have
         # to give it some prompting in the form of a subsubquery.
         def build_subselect(key, o)
           subselect = super

@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-require "abstract_unit"
+require_relative "../abstract_unit"
 
 class MethodCallAssertionsTest < ActiveSupport::TestCase
   class Level
@@ -79,13 +79,6 @@ class MethodCallAssertionsTest < ActiveSupport::TestCase
       assert_called_with(@object, :<<, [ 4567 ]) do
         @object << 2
       end
-    end
-  end
-
-  def test_assert_called_with_multiple_expected_arguments
-    assert_called_with(@object, :<<, [ [ 1 ], [ 2 ] ]) do
-      @object << 1
-      @object << 2
     end
   end
 
@@ -199,5 +192,21 @@ class MethodCallAssertionsTest < ActiveSupport::TestCase
       assert_equal @object, instance
       assert_equal instance, Level.new
     end
+  end
+
+  def test_assert_changes_when_assertions_are_included
+    test_unit_class = Class.new(Minitest::Test) do
+      include ActiveSupport::Testing::Assertions
+
+      def test_assert_changes
+        counter = 1
+        assert_changes(-> { counter }) do
+          counter = 2
+        end
+      end
+    end
+
+    test_results = test_unit_class.new(:test_assert_changes).run
+    assert_predicate test_results, :passed?
   end
 end

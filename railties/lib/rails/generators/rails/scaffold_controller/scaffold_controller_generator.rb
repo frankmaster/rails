@@ -13,7 +13,9 @@ module Rails
       class_option :orm, banner: "NAME", type: :string, required: true,
                          desc: "ORM to generate the controller for"
       class_option :api, type: :boolean,
-                         desc: "Generates API controller"
+                         desc: "Generate API controller"
+
+      class_option :skip_routes, type: :boolean, desc: "Don't add routes to config/routes.rb."
 
       argument :attributes, type: :array, default: [], banner: "field:type field:type"
 
@@ -24,6 +26,10 @@ module Rails
 
       hook_for :template_engine, as: :scaffold do |template_engine|
         invoke template_engine unless options.api?
+      end
+
+      hook_for :resource_route, required: true do |route|
+        invoke route unless options.skip_routes?
       end
 
       hook_for :test_framework, as: :scaffold

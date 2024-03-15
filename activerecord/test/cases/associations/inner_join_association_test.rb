@@ -10,14 +10,16 @@ require "models/categorization"
 require "models/person"
 require "models/tagging"
 require "models/tag"
+require "models/sharded/blog_post"
+require "models/sharded/comment"
 
 class InnerJoinAssociationTest < ActiveRecord::TestCase
   fixtures :authors, :author_addresses, :essays, :posts, :comments, :categories, :categories_posts, :categorizations,
-           :taggings, :tags
+           :taggings, :tags, :people, :sharded_comments, :sharded_blog_posts
 
   def test_construct_finder_sql_applies_aliases_tables_on_association_conditions
-    result = Author.joins(:thinking_posts, :welcome_posts).to_a
-    assert_equal authors(:david), result.first
+    result = Author.joins(:thinking_posts, :welcome_posts).first
+    assert_equal authors(:david), result
   end
 
   def test_construct_finder_sql_does_not_table_name_collide_on_duplicate_associations
@@ -36,16 +38,64 @@ class InnerJoinAssociationTest < ActiveRecord::TestCase
   end
 
   def test_construct_finder_sql_does_not_table_name_collide_with_string_joins
-    sql = Person.joins(:agents).joins("JOIN people agents_people ON agents_people.primary_contact_id = people.id").to_sql
-    assert_match(/agents_people_2/i, sql)
+    string_join = <<~SQL
+      JOIN people agents_people ON agents_people.primary_contact_id = agents_people_2.id AND agents_people.id > agents_people_2.id
+    SQL
+
+    expected = people(:susan)
+    assert_queries_match(/agents_people_2/i) do
+      assert_equal [expected], Person.joins(:agents).joins(string_join)
+    end
   end
 
   def test_construct_finder_sql_does_not_table_name_collide_with_aliased_joins
-    people = Person.arel_table
-    agents = people.alias("agents_people")
-    constraint = agents[:primary_contact_id].eq(people[:id])
-    sql = Person.joins(:agents).joins(agents.create_join(agents, agents.create_on(constraint))).to_sql
-    assert_match(/agents_people_2/i, sql)
+    agents = Person.arel_table.alias("agents_people")
+    agents_2 = Person.arel_table.alias("agents_people_2")
+    constraint = agents[:primary_contact_id].eq(agents_2[:id]).and(agents[:id].gt(agents_2[:id]))
+
+    expected = people(:susan)
+    assert_queries_match(/agents_people_2/i) do
+      assert_equal [expected], Person.joins(:agents).joins(agents.create_join(agents, agents.create_on(constraint)))
+    end
+  end
+
+  def test_user_supplied_joins_order_should_be_preserved
+    string_join = <<~SQL
+      JOIN people agents_people_2 ON agents_people_2.primary_contact_id = people.id
+    SQL
+    agents = Person.arel_table.alias("agents_people")
+    agents_2 = Person.arel_table.alias("agents_people_2")
+    constraint = agents[:primary_contact_id].eq(agents_2[:id]).and(agents[:id].gt(agents_2[:id]))
+
+    expected = people(:susan)
+    assert_equal [expected], Person.joins(string_join).joins(agents.create_join(agents, agents.create_on(constraint)))
+  end
+
+  def test_deduplicate_joins
+    posts = Post.arel_table
+    constraint = posts[:author_id].eq(Author.arel_table[:id])
+
+    authors = Author.joins(posts.create_join(posts, posts.create_on(constraint)))
+    authors = authors.joins(:author_address).merge(authors.where("posts.type": "SpecialPost"))
+
+    assert_equal [authors(:david)], authors
+  end
+
+  def test_eager_load_with_string_joins
+    string_join = <<~SQL
+      LEFT JOIN people agents_people ON agents_people.primary_contact_id = agents_people_2.id AND agents_people.id > agents_people_2.id
+    SQL
+
+    assert_equal 3, Person.eager_load(:agents).joins(string_join).count
+  end
+
+  def test_eager_load_with_arel_joins
+    agents = Person.arel_table.alias("agents_people")
+    agents_2 = Person.arel_table.alias("agents_people_2")
+    constraint = agents[:primary_contact_id].eq(agents_2[:id]).and(agents[:id].gt(agents_2[:id]))
+    arel_join = agents.create_join(agents, agents.create_on(constraint), Arel::Nodes::OuterJoin)
+
+    assert_equal 3, Person.eager_load(:agents).joins(arel_join).count
   end
 
   def test_construct_finder_sql_ignores_empty_joins_hash
@@ -71,7 +121,12 @@ class InnerJoinAssociationTest < ActiveRecord::TestCase
 
   def test_join_conditions_allow_nil_associations
     authors = Author.includes(:essays).where(essays: { id: nil })
-    assert_equal 2, authors.count
+    assert_equal 1, authors.count
+  end
+
+  def test_join_with_reserved_word
+    assert_equal [categories_posts(:technology_welcome)],
+      Post::CategoryPost.joins(:group).where("group.id": categories(:technology))
   end
 
   def test_find_with_implicit_inner_joins_without_select_does_not_imply_readonly
@@ -125,7 +180,7 @@ class InnerJoinAssociationTest < ActiveRecord::TestCase
 
   def test_find_with_conditions_on_reflection
     assert_not_empty posts(:welcome).comments
-    assert Post.joins(:nonexistent_comments).where(id: posts(:welcome).id).empty? # [sic!]
+    assert_predicate Post.joins(:nonexistent_comments).where(id: posts(:welcome).id), :empty? # [sic!]
   end
 
   def test_find_with_conditions_on_through_reflection
@@ -158,5 +213,22 @@ class InnerJoinAssociationTest < ActiveRecord::TestCase
     categories = author.categories.eager_load(:special_categorizations).order(:name).to_a
     assert_equal 0, categories.first.special_categorizations.size
     assert_equal 1, categories.second.special_categorizations.size
+  end
+
+  test "joins a belongs_to association with a composite foreign key" do
+    first_post_comments = Sharded::Comment.joins(:blog_post).where(blog_post: { title: "My first post in my Blog1!" }).to_a
+    expected_blog_post = sharded_blog_posts(:great_post_blog_one)
+
+    assert_not_empty comments
+    assert_equal(expected_blog_post.comments.to_a.sort, first_post_comments.sort)
+  end
+
+  test "joins a has_many association with a composite foreign key" do
+    blog_posts = Sharded::BlogPost.joins(:comments).where(comments: { body: "Your first blog post is great!" }).to_a
+
+    expected_comment = sharded_comments(:unique_comment_blog_post_one)
+
+    assert_not_empty blog_posts
+    assert_equal(expected_comment.blog_post, blog_posts.first)
   end
 end

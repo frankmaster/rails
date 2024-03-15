@@ -2,9 +2,11 @@
 
 module ActiveRecord
   module Associations
-    class SingularAssociation < Association #:nodoc:
+    class SingularAssociation < Association # :nodoc:
       # Implements the reader method, e.g. foo.bar for Foo.has_one :bar
       def reader
+        ensure_klass_exists!
+
         if !loaded? || stale_target?
           reload
         end
@@ -12,12 +14,18 @@ module ActiveRecord
         target
       end
 
+      # Resets the \loaded flag to +false+ and sets the \target to +nil+.
+      def reset
+        super
+        @target = nil
+      end
+
       # Implements the writer method, e.g. foo.bar= for Foo.belongs_to :bar
       def writer(record)
         replace(record)
       end
 
-      def build(attributes = {}, &block)
+      def build(attributes = nil, &block)
         record = build_record(attributes, &block)
         set_new_record(record)
         record
@@ -32,11 +40,15 @@ module ActiveRecord
 
       private
         def scope_for_create
-          super.except!(klass.primary_key)
+          super.except!(*Array(klass.primary_key))
         end
 
         def find_target
-          super.first
+          if disable_joins
+            scope.first
+          else
+            super.first
+          end
         end
 
         def replace(record)

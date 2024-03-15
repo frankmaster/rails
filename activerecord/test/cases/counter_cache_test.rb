@@ -2,6 +2,8 @@
 
 require "cases/helper"
 require "models/topic"
+require "models/bulb"
+require "models/person"
 require "models/car"
 require "models/aircraft"
 require "models/wheel"
@@ -11,14 +13,16 @@ require "models/category"
 require "models/categorization"
 require "models/dog"
 require "models/dog_lover"
-require "models/person"
 require "models/friendship"
 require "models/subscriber"
 require "models/subscription"
 require "models/book"
+require "models/cpk"
+require "active_support/core_ext/enumerable"
 
 class CounterCacheTest < ActiveRecord::TestCase
-  fixtures :topics, :categories, :categorizations, :cars, :dogs, :dog_lovers, :people, :friendships, :subscribers, :subscriptions, :books
+  fixtures :topics, :categories, :categorizations, :cars, :dogs, :dog_lovers, :people, :friendships, :subscribers, :subscriptions, :books,
+    :cpk_orders, :cpk_books
 
   class ::SpecialTopic < ::Topic
     has_many :special_replies, foreign_key: "parent_id"
@@ -39,9 +43,42 @@ class CounterCacheTest < ActiveRecord::TestCase
     end
   end
 
+  test "increment counter by specific amount" do
+    assert_difference -> { @topic.reload.replies_count }, +2 do
+      Topic.increment_counter(:replies_count, @topic.id, by: 2)
+    end
+  end
+
+  test "increment counter for cpk model" do
+    order = Cpk::Order.first
+    assert_difference -> { order.reload.books_count } do
+      Cpk::Order.increment_counter(:books_count, order.id)
+    end
+  end
+
+  test "increment counter for multiple cpk model records" do
+    order1, order2 = Cpk::Order.first(2)
+    assert_difference [-> { order1.reload.books_count }, -> { order2.reload.books_count }] do
+      Cpk::Order.increment_counter(:books_count, [order1.id, order2.id])
+    end
+  end
+
   test "decrement counter" do
     assert_difference "@topic.reload.replies_count", -1 do
       Topic.decrement_counter(:replies_count, @topic.id)
+    end
+  end
+
+  test "decrement counter by specific amount" do
+    assert_difference "@topic.reload.replies_count", -2 do
+      Topic.decrement_counter(:replies_count, @topic.id, by: 2)
+    end
+  end
+
+  test "decrement counter for cpk model" do
+    order = Cpk::Order.first
+    assert_difference -> { order.reload.books_count }, -1 do
+      Cpk::Order.decrement_counter(:books_count, order.id)
     end
   end
 
@@ -113,6 +150,38 @@ class CounterCacheTest < ActiveRecord::TestCase
     end
   end
 
+  test "reset counter skips query for correct counter" do
+    Topic.reset_counters(@topic.id, :replies_count)
+
+    # SELECT "topics".* FROM "topics" WHERE "topics"."id" = ? LIMIT ?
+    # SELECT COUNT(*) FROM "topics" WHERE "topics"."type" IN (?, ?, ?, ?, ?) AND "topics"."parent_id" = ?
+    assert_queries_count(2) do
+      Topic.reset_counters(@topic.id, :replies_count)
+    end
+  end
+
+  test "reset counter performs query for correct counter with touch: true" do
+    Topic.reset_counters(@topic.id, :replies_count)
+
+    # SELECT "topics".* FROM "topics" WHERE "topics"."id" = ? LIMIT ?
+    # SELECT COUNT(*) FROM "topics" WHERE "topics"."type" IN (?, ?, ?, ?, ?) AND "topics"."parent_id" = ?
+    # UPDATE "topics" SET "updated_at" = ? WHERE "topics"."id" = ?
+    assert_queries_count(3) do
+      Topic.reset_counters(@topic.id, :replies_count, touch: true)
+    end
+  end
+
+  test "reset counters for cpk model" do
+    order = Cpk::Order.first
+    # throw the count off by 1
+    Cpk::Order.increment_counter(:books_count, order.id)
+
+    # check that it gets reset
+    assert_difference -> { order.reload.books_count }, -1 do
+      Cpk::Order.reset_counters(order.id, :books)
+    end
+  end
+
   test "update counter with initial null value" do
     category = categories(:general)
     assert_equal 2, category.categorizations.count
@@ -139,6 +208,13 @@ class CounterCacheTest < ActiveRecord::TestCase
   test "update multiple counters" do
     assert_difference ["@topic.reload.replies_count", "@topic.reload.unique_replies_count"], 2 do
       Topic.update_counters @topic.id, replies_count: 2, unique_replies_count: 2
+    end
+  end
+
+  test "update counter for decrement for cpk model" do
+    order = Cpk::Order.first
+    assert_difference -> { order.reload.books_count }, -3 do
+      Cpk::Order.update_counters(order.id, books_count: -3)
     end
   end
 
@@ -214,6 +290,15 @@ class CounterCacheTest < ActiveRecord::TestCase
     end
   end
 
+  test "removing association updates counter" do
+    michael = people(:michael)
+    car = cars(:honda)
+
+    assert_difference -> { michael.reload.cars_count }, -1 do
+      car.destroy
+    end
+  end
+
   test "update counters doesn't touch timestamps by default" do
     @topic.update_column :updated_at, 5.minutes.ago
     previously_updated_at = @topic.updated_at
@@ -263,7 +348,7 @@ class CounterCacheTest < ActiveRecord::TestCase
   test "reset multiple counters with touch: true" do
     assert_touching @topic, :updated_at do
       Topic.update_counters(@topic.id, replies_count: 1, unique_replies_count: 1)
-      Topic.reset_counters(@topic.id, :replies, :unique_replies, touch: true)
+      Topic.reset_counters(@topic.id, :replies, :unique_replies, touch: { time: Time.now.utc })
     end
   end
 
@@ -353,10 +438,15 @@ class CounterCacheTest < ActiveRecord::TestCase
     end
   end
 
+  test "counter_cache_column?" do
+    assert Person.counter_cache_column?("cars_count")
+    assert_not Car.counter_cache_column?("cars_count")
+  end
+
   private
     def assert_touching(record, *attributes)
-      record.update_columns attributes.map { |attr| [ attr, 5.minutes.ago ] }.to_h
-      touch_times = attributes.map { |attr| [ attr, record.public_send(attr) ] }.to_h
+      record.update_columns attributes.index_with(5.minutes.ago)
+      touch_times = attributes.index_with { |attr| record.public_send(attr) }
 
       yield
 

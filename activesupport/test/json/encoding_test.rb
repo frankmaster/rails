@@ -1,12 +1,12 @@
 # frozen_string_literal: true
 
 require "securerandom"
-require "abstract_unit"
+require_relative "../abstract_unit"
 require "active_support/core_ext/string/inflections"
 require "active_support/json"
 require "active_support/time"
-require "time_zone_test_helpers"
-require "json/encoding_test_cases"
+require_relative "../time_zone_test_helpers"
+require_relative "../json/encoding_test_cases"
 
 class TestJSONEncoding < ActiveSupport::TestCase
   include TimeZoneTestHelpers
@@ -37,8 +37,6 @@ class TestJSONEncoding < ActiveSupport::TestCase
   end
 
   def test_process_status
-    rubinius_skip "https://github.com/rubinius/rubinius/issues/3334"
-
     # There doesn't seem to be a good way to get a handle on a Process::Status object without actually
     # creating a child process, hence this to populate $?
     system("not_a_real_program_#{SecureRandom.hex}")
@@ -163,7 +161,6 @@ class TestJSONEncoding < ActiveSupport::TestCase
 
     assert_equal({ "foo" => { "foo" => "hello" } }, JSON.parse(json))
   end
-
 
   def test_hash_should_pass_encoding_options_to_children_in_as_json
     person = {
@@ -335,6 +332,17 @@ class TestJSONEncoding < ActiveSupport::TestCase
 
     assert_equal({ "name" => "David", "date" => "2010-01-01" },
                  ActiveSupport::JSON.decode(json_string_and_date))
+  end
+
+  if RUBY_VERSION >= "3.2"
+    def test_data_encoding
+      data = Data.define(:name, :email).new("test", "test@example.com")
+
+      assert_nothing_raised { data.to_json }
+
+      assert_equal({ "name" => "test", "email" => "test@example.com" },
+        ActiveSupport::JSON.decode(data.to_json))
+    end
   end
 
   def test_nil_true_and_false_represented_as_themselves

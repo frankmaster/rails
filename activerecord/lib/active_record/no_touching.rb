@@ -26,20 +26,20 @@ module ActiveRecord
     end
 
     class << self
-      def apply_to(klass) #:nodoc:
+      def apply_to(klass) # :nodoc:
         klasses.push(klass)
         yield
       ensure
         klasses.pop
       end
 
-      def applied_to?(klass) #:nodoc:
+      def applied_to?(klass) # :nodoc:
         klasses.any? { |k| k >= klass }
       end
 
       private
         def klasses
-          Thread.current[:no_touching_classes] ||= []
+          ActiveSupport::IsolatedExecutionState[:active_record_no_touching_classes] ||= []
         end
     end
 
@@ -58,7 +58,7 @@ module ActiveRecord
       super unless no_touching?
     end
 
-    def touch(*) # :nodoc:
+    def touch(*, **) # :nodoc:
       super unless no_touching?
     end
   end

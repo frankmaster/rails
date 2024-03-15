@@ -1,16 +1,21 @@
 # frozen_string_literal: true
 
+require "marcel"
+
 module ActiveStorage::Blob::Representable
   extend ActiveSupport::Concern
 
   included do
+    has_many :variant_records, class_name: "ActiveStorage::VariantRecord", dependent: false
+    before_destroy { variant_records.destroy_all if ActiveStorage.track_variants }
+
     has_one_attached :preview_image
   end
 
-  # Returns an ActiveStorage::Variant instance with the set of +transformations+ provided. This is only relevant for image
-  # files, and it allows any image to be transformed for size, colors, and the like. Example:
+  # Returns an ActiveStorage::Variant or ActiveStorage::VariantWithRecord instance with the set of +transformations+ provided.
+  # This is only relevant for image files, and it allows any image to be transformed for size, colors, and the like. Example:
   #
-  #   avatar.variant(resize_to_limit: [100, 100]).processed.service_url
+  #   avatar.variant(resize_to_limit: [100, 100]).processed.url
   #
   # This will create and process a variant of the avatar blob that's constrained to a height and width of 100px.
   # Then it'll upload said variant to the service according to a derivative key of the blob and the transformations.
@@ -23,17 +28,19 @@ module ActiveStorage::Blob::Representable
   # This will create a URL for that specific blob with that specific variant, which the ActiveStorage::RepresentationsController
   # can then produce on-demand.
   #
-  # Raises ActiveStorage::InvariableError if ImageMagick cannot transform the blob. To determine whether a blob is
-  # variable, call ActiveStorage::Blob#variable?.
+  # Raises ActiveStorage::InvariableError if the variant processor cannot
+  # transform the blob. To determine whether a blob is variable, call
+  # ActiveStorage::Blob#variable?.
   def variant(transformations)
     if variable?
-      ActiveStorage::Variant.new(self, transformations)
+      variant_class.new(self, ActiveStorage::Variation.wrap(transformations).default_to(default_variant_transformations))
     else
       raise ActiveStorage::InvariableError
     end
   end
 
-  # Returns true if ImageMagick can transform the blob (its content type is in +ActiveStorage.variable_content_types+).
+  # Returns true if the variant processor can transform the blob (its content
+  # type is in +ActiveStorage.variable_content_types+).
   def variable?
     ActiveStorage.variable_content_types.include?(content_type)
   end
@@ -43,7 +50,7 @@ module ActiveStorage::Blob::Representable
   # from a non-image blob. Active Storage comes with built-in previewers for videos and PDF documents. The video previewer
   # extracts the first frame from a video and the PDF previewer extracts the first page from a PDF document.
   #
-  #   blob.preview(resize_to_limit: [100, 100]).processed.service_url
+  #   blob.preview(resize_to_limit: [100, 100]).processed.url
   #
   # Avoid processing previews synchronously in views. Instead, link to a controller action that processes them on demand.
   # Active Storage provides one, but you may want to create your own (for example, if you need authentication). Here’s
@@ -69,7 +76,7 @@ module ActiveStorage::Blob::Representable
 
   # Returns an ActiveStorage::Preview for a previewable blob or an ActiveStorage::Variant for a variable image blob.
   #
-  #   blob.representation(resize_to_limit: [100, 100]).processed.service_url
+  #   blob.representation(resize_to_limit: [100, 100]).processed.url
   #
   # Raises ActiveStorage::UnrepresentableError if the receiving blob is neither variable nor previewable. Call
   # ActiveStorage::Blob#representable? to determine whether a blob is representable.
@@ -90,4 +97,41 @@ module ActiveStorage::Blob::Representable
   def representable?
     variable? || previewable?
   end
+
+  def preview_image_needed_before_processing_variants?
+    previewable? && !preview_image.attached?
+  end
+
+  def create_preview_image_later(variations) # :nodoc:
+    ActiveStorage::PreviewImageJob.perform_later(self, variations) if representable?
+  end
+
+  def preprocessed(transformations) # :nodoc:
+    ActiveStorage::TransformJob.perform_later(self, transformations) if representable?
+  end
+
+  private
+    def default_variant_transformations
+      { format: default_variant_format }
+    end
+
+    def default_variant_format
+      if web_image?
+        format || :png
+      else
+        :png
+      end
+    end
+
+    def format
+      if filename.extension.present? && Marcel::MimeType.for(extension: filename.extension) == content_type
+        filename.extension
+      else
+        Marcel::Magic.new(content_type.to_s).extensions.first
+      end
+    end
+
+    def variant_class
+      ActiveStorage.track_variants ? ActiveStorage::VariantWithRecord : ActiveStorage::Variant
+    end
 end

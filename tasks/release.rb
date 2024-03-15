@@ -99,12 +99,33 @@ npm_version = version.gsub(/\./).with_index { |s, i| i >= 2 ? "-" : s }
     end
 
     task push: :build do
-      sh "gem push #{gem}"
+      otp = ""
+      begin
+        otp = " --otp " + `ykman oath accounts code -s rubygems.org`.chomp
+      rescue
+        # User doesn't have ykman
+      end
+
+      sh "gem push #{gem}#{otp}"
 
       if File.exist?("#{framework}/package.json")
         Dir.chdir("#{framework}") do
-          npm_tag = /[a-z]/.match?(version) ? "pre" : "latest"
-          sh "npm publish --tag #{npm_tag}"
+          npm_otp = ""
+          begin
+            npm_otp = " --otp " + `ykman oath accounts code -s npmjs.com`.chomp
+          rescue
+            # User doesn't have ykman
+          end
+
+          npm_tag = ""
+          if /[a-z]/.match?(version)
+            npm_tag = " --tag pre"
+          else
+            local_major_version = version.split(".", 4)[0]
+            npm_tag = " --tag v#{local_major_version}"
+          end
+
+          sh "npm publish#{npm_tag}#{npm_otp}"
         end
       end
     end
@@ -139,7 +160,7 @@ namespace :changelog do
   task :release_summary, [:base_release, :release] do |_, args|
     release_regexp = args[:base_release] ? Regexp.escape(args[:base_release]) : /\d+\.\d+\.\d+/
 
-    puts release
+    puts args[:release]
 
     FRAMEWORKS.each do |fw|
       puts "## #{FRAMEWORK_NAMES[fw]}"
@@ -189,8 +210,8 @@ namespace :all do
     end
 
     # Replace the generated gemfile entry with the exact version.
-    substitute.call("Gemfile", /^gem 'rails.*/, "gem 'rails', '#{version}'")
-    substitute.call("Gemfile", /^# gem 'image_processing/, "gem 'image_processing")
+    substitute.call("Gemfile", /^gem "rails.*/, %{gem "rails", "#{version}"})
+    substitute.call("Gemfile", /^# gem "image_processing/, 'gem "image_processing')
     sh "bundle"
     sh "rails action_mailbox:install"
     sh "rails action_text:install"
@@ -226,8 +247,9 @@ namespace :all do
     # Permit the avatar param.
     substitute.call("app/controllers/users_controller.rb", /:admin/, ":admin, :avatar")
 
-    if ENV["EDITOR"]
-      `#{ENV["EDITOR"]} #{File.expand_path(app_name)}`
+    editor = ENV["VISUAL"] || ENV["EDITOR"]
+    if editor
+      `#{editor} #{File.expand_path(app_name)}`
     end
 
     puts "Booting a Rails server. Verify the release by:"
@@ -291,7 +313,7 @@ module Announcement
     end
 
     def rc?
-      @version =~ /rc/
+      @version.include?("rc")
     end
   end
 end
@@ -314,10 +336,6 @@ task :announce do
     require "erb"
     template = File.read("../tasks/release_announcement_draft.erb")
 
-    if ERB.instance_method(:initialize).parameters.assoc(:key) # Ruby 2.6+
-      puts ERB.new(template, trim_mode: "<>").result(binding)
-    else
-      puts ERB.new(template, nil, "<>").result(binding)
-    end
+    puts ERB.new(template, trim_mode: "<>").result(binding)
   end
 end

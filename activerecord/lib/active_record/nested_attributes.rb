@@ -5,7 +5,7 @@ require "active_support/core_ext/module/redefine_method"
 require "active_support/core_ext/hash/indifferent_access"
 
 module ActiveRecord
-  module NestedAttributes #:nodoc:
+  module NestedAttributes # :nodoc:
     class TooManyRecords < ActiveRecordError
     end
 
@@ -15,7 +15,7 @@ module ActiveRecord
       class_attribute :nested_attributes_options, instance_writer: false, default: {}
     end
 
-    # = Active Record Nested Attributes
+    # = Active Record Nested \Attributes
     #
     # Nested attributes allow you to save attributes on associated records
     # through the parent. By default nested attribute updating is turned off
@@ -180,7 +180,7 @@ module ActiveRecord
     #   member.posts.second.title # => '[UPDATED] other post'
     #
     # However, the above applies if the parent model is being updated as well.
-    # For example, If you wanted to create a +member+ named _joe_ and wanted to
+    # For example, if you wanted to create a +member+ named _joe_ and wanted to
     # update the +posts+ at the same time, that would give an
     # ActiveRecord::RecordNotFound error.
     #
@@ -245,18 +245,19 @@ module ActiveRecord
     #
     # === Validating the presence of a parent model
     #
-    # If you want to validate that a child record is associated with a parent
-    # record, you can use the +validates_presence_of+ method and the +:inverse_of+
-    # key as this example illustrates:
+    # The +belongs_to+ association validates the presence of the parent model
+    # by default. You can disable this behavior by specifying <code>optional: true</code>.
+    # This can be used, for example, when conditionally validating the presence
+    # of the parent model:
     #
-    #   class Member < ActiveRecord::Base
-    #     has_many :posts, inverse_of: :member
-    #     accepts_nested_attributes_for :posts
+    #   class Veterinarian < ActiveRecord::Base
+    #     has_many :patients, inverse_of: :veterinarian
+    #     accepts_nested_attributes_for :patients
     #   end
     #
-    #   class Post < ActiveRecord::Base
-    #     belongs_to :member, inverse_of: :posts
-    #     validates_presence_of :member
+    #   class Patient < ActiveRecord::Base
+    #     belongs_to :veterinarian, inverse_of: :patients, optional: true
+    #     validates :veterinarian, presence: true, unless: -> { awaiting_intake }
     #   end
     #
     # Note that if you do not specify the +:inverse_of+ option, then
@@ -279,6 +280,24 @@ module ActiveRecord
     #   member = Member.new
     #   member.avatar_attributes = {icon: 'sad'}
     #   member.avatar.width # => 200
+    #
+    # === Creating forms with nested attributes
+    #
+    # Use ActionView::Helpers::FormHelper#fields_for to create form elements for
+    # nested attributes.
+    #
+    # Integration test params should reflect the structure of the form. For
+    # example:
+    #
+    #   post members_path, params: {
+    #     member: {
+    #       name: 'joe',
+    #       posts_attributes: {
+    #         '0' => { title: 'Foo' },
+    #         '1' => { title: 'Bar' }
+    #       }
+    #     }
+    #   }
     module ClassMethods
       REJECT_ALL_BLANK_PROC = proc { |attributes| attributes.all? { |key, value| key == "_destroy" || value.blank? } }
 
@@ -288,7 +307,7 @@ module ActiveRecord
       # [:allow_destroy]
       #   If true, destroys any members from the attributes hash with a
       #   <tt>_destroy</tt> key and a value that evaluates to +true+
-      #   (eg. 1, '1', true, or 'true'). This option is off by default.
+      #   (e.g. 1, '1', true, or 'true'). This option is false by default.
       # [:reject_if]
       #   Allows you to specify a Proc or a Symbol pointing to a method
       #   that checks whether a record should be built for a certain attribute
@@ -313,11 +332,11 @@ module ActiveRecord
       #   nested attributes are going to be used when an associated record already
       #   exists. In general, an existing record may either be updated with the
       #   new set of attribute values or be replaced by a wholly new record
-      #   containing those values. By default the +:update_only+ option is +false+
+      #   containing those values. By default the +:update_only+ option is false
       #   and the nested attributes are used to update the existing record only
       #   if they include the record's <tt>:id</tt> value. Otherwise a new
       #   record will be instantiated and used to replace the existing one.
-      #   However if the +:update_only+ option is +true+, the nested attributes
+      #   However if the +:update_only+ option is true, the nested attributes
       #   are used to update the record's attributes always, regardless of
       #   whether the <tt>:id</tt> is present. The option is ignored for collection
       #   associations.
@@ -374,11 +393,11 @@ module ActiveRecord
         end
     end
 
-    # Returns ActiveRecord::AutosaveAssociation::marked_for_destruction? It's
+    # Returns ActiveRecord::AutosaveAssociation#marked_for_destruction? It's
     # used in conjunction with fields_for to build a form element for the
     # destruction of this association.
     #
-    # See ActionView::Helpers::FormHelper::fields_for for more info.
+    # See ActionView::Helpers::FormHelper#fields_for for more info.
     def _destroy
       marked_for_destruction?
     end
@@ -402,10 +421,15 @@ module ActiveRecord
       # update_only is true, and a <tt>:_destroy</tt> key set to a truthy value,
       # then the existing record will be marked for destruction.
       def assign_nested_attributes_for_one_to_one_association(association_name, attributes)
-        options = nested_attributes_options[association_name]
         if attributes.respond_to?(:permitted?)
           attributes = attributes.to_h
         end
+
+        unless attributes.is_a?(Hash)
+          raise ArgumentError, "Hash expected for `#{association_name}` attributes, got #{attributes.class.name}"
+        end
+
+        options = nested_attributes_options[association_name]
         attributes = attributes.with_indifferent_access
         existing_record = send(association_name)
 
@@ -467,7 +491,7 @@ module ActiveRecord
         end
 
         unless attributes_collection.is_a?(Hash) || attributes_collection.is_a?(Array)
-          raise ArgumentError, "Hash or Array expected for attribute `#{association_name}`, got #{attributes_collection.class.name} (#{attributes_collection.inspect})"
+          raise ArgumentError, "Hash or Array expected for `#{association_name}` attributes, got #{attributes_collection.class.name}"
         end
 
         check_record_limit!(options[:limit], attributes_collection)
@@ -486,7 +510,7 @@ module ActiveRecord
         existing_records = if association.loaded?
           association.target
         else
-          attribute_ids = attributes_collection.map { |a| a["id"] || a[:id] }.compact
+          attribute_ids = attributes_collection.filter_map { |a| a["id"] || a[:id] }
           attribute_ids.empty? ? [] : association.scope.where(association.klass.primary_key => attribute_ids)
         end
 
@@ -509,7 +533,7 @@ module ActiveRecord
               if target_record
                 existing_record = target_record
               else
-                association.add_to_target(existing_record, :skip_callbacks)
+                association.add_to_target(existing_record, skip_callbacks: true)
               end
 
               assign_to_or_mark_for_destruction(existing_record, attributes, options[:allow_destroy])

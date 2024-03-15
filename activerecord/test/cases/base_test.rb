@@ -26,14 +26,29 @@ require "models/joke"
 require "models/bird"
 require "models/car"
 require "models/bulb"
+require "models/pet"
+require "models/owner"
+require "models/cpk"
 require "concurrent/atomic/count_down_latch"
+require "active_support/core_ext/enumerable"
+require "active_support/core_ext/kernel/reporting"
 
 class FirstAbstractClass < ActiveRecord::Base
   self.abstract_class = true
+
+  connects_to database: { writing: :arunit, reading: :arunit }
 end
+
 class SecondAbstractClass < FirstAbstractClass
   self.abstract_class = true
+
+  connects_to database: { writing: :arunit, reading: :arunit }
 end
+
+class ThirdAbstractClass < SecondAbstractClass
+  self.abstract_class = true
+end
+
 class Photo < SecondAbstractClass; end
 class Smarts < ActiveRecord::Base; end
 class CreditCard < ActiveRecord::Base
@@ -52,6 +67,28 @@ class ReadonlyTitlePost < Post
   attr_readonly :title
 end
 
+class ReadonlyTitleAbstractPost < ActiveRecord::Base
+  self.abstract_class = true
+
+  attr_readonly :title
+end
+
+class ReadonlyTitlePostWithAbstractParent < ReadonlyTitleAbstractPost
+  self.table_name = "posts"
+end
+
+previous_value, ActiveRecord.raise_on_assign_to_attr_readonly = ActiveRecord.raise_on_assign_to_attr_readonly, false
+
+class NonRaisingPost < Post
+  attr_readonly :title
+end
+
+ActiveRecord.raise_on_assign_to_attr_readonly = previous_value
+
+class ReadonlyAuthorPost < Post
+  attr_readonly :author_id
+end
+
 class Weird < ActiveRecord::Base; end
 
 class LintTest < ActiveRecord::TestCase
@@ -65,7 +102,9 @@ class LintTest < ActiveRecord::TestCase
 end
 
 class BasicsTest < ActiveRecord::TestCase
-  fixtures :topics, :companies, :developers, :projects, :computers, :accounts, :minimalistics, "warehouse-things", :authors, :author_addresses, :categorizations, :categories, :posts
+  fixtures :topics, :companies, :developers, :projects, :computers, :accounts,
+    :minimalistics, "warehouse-things", :authors, :author_addresses, :categorizations, :categories,
+    :posts, :cpk_books
 
   def test_generated_association_methods_module_name
     mod = Post.send(:generated_association_methods)
@@ -77,15 +116,36 @@ class BasicsTest < ActiveRecord::TestCase
     assert_equal "Post::GeneratedRelationMethods", mod.inspect
   end
 
+  def test_arel_attribute_normalization
+    assert_equal Post.arel_table["body"], Post.arel_table[:body]
+    assert_equal Post.arel_table["body"], Post.arel_table[:text]
+  end
+
+  def test_incomplete_schema_loading
+    topic = Topic.first
+    payload = { "foo" => 42 }
+    topic.update!(content: payload)
+
+    Topic.reset_column_information
+
+    Topic.connection_pool.stub(:schema_cache, -> { raise "Some Error" }) do
+      assert_raises RuntimeError do
+        Topic.columns_hash
+      end
+    end
+
+    assert_equal payload, Topic.first.content
+  end
+
   def test_column_names_are_escaped
-    conn      = ActiveRecord::Base.connection
+    conn      = ActiveRecord::Base.lease_connection
     classname = conn.class.name[/[^:]*$/]
     badchar   = {
       "SQLite3Adapter"    => '"',
       "Mysql2Adapter"     => "`",
+      "TrilogyAdapter"    => "`",
       "PostgreSQLAdapter" => '"',
       "OracleAdapter"     => '"',
-      "FbAdapter"         => '"'
     }.fetch(classname) {
       raise "need a bad char for #{classname}"
     }
@@ -205,7 +265,7 @@ class BasicsTest < ActiveRecord::TestCase
     )
 
     # For adapters which support microsecond resolution.
-    if subsecond_precision_supported?
+    if supports_datetime_with_precision?
       assert_equal 11, Topic.find(1).written_on.sec
       assert_equal 223300, Topic.find(1).written_on.usec
       assert_equal 9900, Topic.find(2).written_on.usec
@@ -265,6 +325,18 @@ class BasicsTest < ActiveRecord::TestCase
           assert_equal [0, 0, 0, 1, 1, 2000, 6, 1, false, "CST"], time.to_a
           assert_equal [0, 0, 1, 1, 1, 2000, 6, 1, false, "EST"], saved_time.to_a
         end
+      end
+    end
+  end
+
+  def test_time_zone_aware_attribute_with_default_timezone_utc_on_utc_can_be_created
+    with_env_tz eastern_time_zone do
+      with_timezone_config aware_attributes: true, default: :utc, zone: "UTC" do
+        pet = Pet.create(name: "Bidu")
+        assert_predicate pet, :persisted?
+        saved_pet = Pet.find(pet.id)
+        assert_not_nil saved_pet.created_at
+        assert_not_nil saved_pet.updated_at
       end
     end
   end
@@ -448,6 +520,14 @@ class BasicsTest < ActiveRecord::TestCase
     Post.reset_table_name
   end
 
+  def test_table_name_based_on_model_name
+    assert_equal "posts", PostRecord.table_name
+  end
+
+  def test_table_name_for_base_class
+    assert_nil ActiveRecord::Base.table_name
+  end
+
   def test_null_fields
     assert_nil Topic.find(1).parent_id
     assert_nil Topic.create("title" => "Hey you").parent_id
@@ -522,6 +602,10 @@ class BasicsTest < ActiveRecord::TestCase
     assert_equal Topic.find("1-meowmeow"), Topic.find(1)
   end
 
+  def test_out_of_range_slugs
+    assert_equal [Topic.find(1)], Topic.where(id: ["1-meowmeow", "9223372036854775808-hello"])
+  end
+
   def test_find_by_slug_with_array
     assert_equal Topic.find([1, 2]), Topic.find(["1-meowmeow", "2-hello"])
     assert_equal "The Second Topic of the day", Topic.find(["2-hello", "1-meowmeow"]).first.title
@@ -555,26 +639,29 @@ class BasicsTest < ActiveRecord::TestCase
     car = Car.create!
     car.bulbs.build
     car.save
+    bulbs_of_car = Bulb.where(car_id: car.id)
 
-    assert car.bulbs == Bulb.where(car_id: car.id), "CollectionProxy should be comparable with Relation"
-    assert Bulb.where(car_id: car.id) == car.bulbs, "Relation should be comparable with CollectionProxy"
+    assert_equal car.bulbs, bulbs_of_car, "CollectionProxy should be comparable with Relation"
+    assert_equal bulbs_of_car, car.bulbs, "Relation should be comparable with CollectionProxy"
   end
 
   def test_equality_of_relation_and_array
     car = Car.create!
     car.bulbs.build
     car.save
+    bulbs_of_car = Bulb.where(car_id: car.id)
 
-    assert Bulb.where(car_id: car.id) == car.bulbs.to_a, "Relation should be comparable with Array"
+    assert_equal bulbs_of_car, car.bulbs.to_a, "Relation should be comparable with Array"
   end
 
   def test_equality_of_relation_and_association_relation
     car = Car.create!
     car.bulbs.build
     car.save
+    bulbs_of_car = Bulb.where(car_id: car.id)
 
-    assert_equal Bulb.where(car_id: car.id), car.bulbs.includes(:car), "Relation should be comparable with AssociationRelation"
-    assert_equal car.bulbs.includes(:car), Bulb.where(car_id: car.id), "AssociationRelation should be comparable with Relation"
+    assert_equal bulbs_of_car, car.bulbs.includes(:car), "Relation should be comparable with AssociationRelation"
+    assert_equal car.bulbs.includes(:car), bulbs_of_car, "AssociationRelation should be comparable with Relation"
   end
 
   def test_equality_of_collection_proxy_and_association_relation
@@ -604,7 +691,7 @@ class BasicsTest < ActiveRecord::TestCase
   end
 
   def test_create_without_prepared_statement
-    topic = Topic.connection.unprepared_statement do
+    topic = Topic.lease_connection.unprepared_statement do
       Topic.create(title: "foo")
     end
 
@@ -613,7 +700,7 @@ class BasicsTest < ActiveRecord::TestCase
 
   def test_destroy_without_prepared_statement
     topic = Topic.create(title: "foo")
-    Topic.connection.unprepared_statement do
+    Topic.lease_connection.unprepared_statement do
       Topic.find(topic.id).destroy
     end
 
@@ -634,16 +721,166 @@ class BasicsTest < ActiveRecord::TestCase
   end
 
   def test_readonly_attributes
-    assert_equal Set.new([ "title", "comments_count" ]), ReadonlyTitlePost.readonly_attributes
+    assert_equal [ "title" ], ReadonlyTitlePost.readonly_attributes
 
     post = ReadonlyTitlePost.create(title: "cannot change this", body: "changeable")
-    post.reload
     assert_equal "cannot change this", post.title
+    assert_equal "changeable", post.body
 
-    post.update(title: "try to change", body: "changed")
+    post = Post.find(post.id)
+    assert_equal "cannot change this", post.title
+    assert_equal "changeable", post.body
+
+    assert_raises(ActiveRecord::ReadonlyAttributeError) do
+      post.title = "changed via assignment"
+    end
+    post.body = "changed via assignment"
+    assert_equal "cannot change this", post.title
+    assert_equal "changed via assignment", post.body
+
+    assert_raises(ActiveRecord::ReadonlyAttributeError) do
+      post.write_attribute(:title, "changed via write_attribute")
+    end
+    post.write_attribute(:body, "changed via write_attribute")
+    assert_equal "cannot change this", post.title
+    assert_equal "changed via write_attribute", post.body
+
+    assert_raises(ActiveRecord::ReadonlyAttributeError) do
+      post.assign_attributes(body: "changed via assign_attributes", title: "changed via assign_attributes")
+    end
+    assert_equal "cannot change this", post.title
+    assert_equal "changed via assign_attributes", post.body
+
+    assert_raises(ActiveRecord::ReadonlyAttributeError) do
+      post.update(title: "changed via update", body: "changed via update")
+    end
+    assert_equal "cannot change this", post.title
+    assert_equal "changed via assign_attributes", post.body
+
+    assert_raises(ActiveRecord::ReadonlyAttributeError) do
+      post[:title] = "changed via []="
+    end
+    post[:body] = "changed via []="
+    assert_equal "cannot change this", post.title
+    assert_equal "changed via []=", post.body
+
+    post.save!
+
+    post = Post.find(post.id)
+    assert_equal "cannot change this", post.title
+    assert_equal "changed via []=", post.body
+  end
+
+  def test_readonly_attributes_on_a_new_record
+    assert_equal [ "title" ], ReadonlyTitlePost.readonly_attributes
+
+    post = ReadonlyTitlePost.new(title: "can change this until you save", body: "changeable")
+    assert_equal "can change this until you save", post.title
+    assert_equal "changeable", post.body
+
+    post.title = "changed via assignment"
+    post.body = "changed via assignment"
+    assert_equal "changed via assignment", post.title
+    assert_equal "changed via assignment", post.body
+
+    post.write_attribute(:title, "changed via write_attribute")
+    post.write_attribute(:body, "changed via write_attribute")
+    assert_equal "changed via write_attribute", post.title
+    assert_equal "changed via write_attribute", post.body
+
+    post.assign_attributes(body: "changed via assign_attributes", title: "changed via assign_attributes")
+    assert_equal "changed via assign_attributes", post.title
+    assert_equal "changed via assign_attributes", post.body
+
+    post[:title] = "changed via []="
+    post[:body] = "changed via []="
+    assert_equal "changed via []=", post.title
+    assert_equal "changed via []=", post.body
+
+    post.save!
+
+    post = Post.find(post.id)
+    assert_equal "changed via []=", post.title
+    assert_equal "changed via []=", post.body
+  end
+
+  def test_readonly_attributes_in_abstract_class_descendant
+    assert_equal [ "title" ], ReadonlyTitlePostWithAbstractParent.readonly_attributes
+
+    assert_nothing_raised do
+      ReadonlyTitlePostWithAbstractParent.new(title: "can change this until you save")
+    end
+  end
+
+  def test_readonly_attributes_when_configured_to_not_raise
+    assert_equal [ "title" ], NonRaisingPost.readonly_attributes
+
+    post = NonRaisingPost.create(title: "cannot change this", body: "changeable")
+    assert_equal "cannot change this", post.title
+    assert_equal "changeable", post.body
+
+    post = Post.find(post.id)
+    assert_equal "cannot change this", post.title
+    assert_equal "changeable", post.body
+
+    post.title = "changed via assignment"
+    post.body = "changed via assignment"
+    post.save!
     post.reload
     assert_equal "cannot change this", post.title
-    assert_equal "changed", post.body
+    assert_equal "changed via assignment", post.body
+
+    post.write_attribute(:title, "changed via write_attribute")
+    post.write_attribute(:body, "changed via write_attribute")
+    post.save!
+    post.reload
+    assert_equal "cannot change this", post.title
+    assert_equal "changed via write_attribute", post.body
+
+    post.assign_attributes(body: "changed via assign_attributes", title: "changed via assign_attributes")
+    post.save!
+    post.reload
+    assert_equal "cannot change this", post.title
+    assert_equal "changed via assign_attributes", post.body
+
+    post.update(title: "changed via update", body: "changed via update")
+    post.reload
+    assert_equal "cannot change this", post.title
+    assert_equal "changed via update", post.body
+
+    post[:title] = "changed via []="
+    post[:body] = "changed via []="
+    post.save!
+    post.reload
+    assert_equal "cannot change this", post.title
+    assert_equal "changed via []=", post.body
+  end
+
+  def test_readonly_attributes_on_belongs_to_association
+    assert_equal [ "author_id" ], ReadonlyAuthorPost.readonly_attributes
+
+    author1 = Author.create!(name: "Alex")
+    author2 = Author.create!(name: "Not Alex")
+
+    post_with_reload = ReadonlyAuthorPost.create!(author: author1, title: "Hi", body: "there")
+    post_with_reload.reload
+    post_with_reload.update(title: "Hello", body: "world")
+    assert_equal author1, post_with_reload.author
+
+    post_with_reload2 = ReadonlyAuthorPost.create!(author: author1, title: "Hi", body: "there")
+    post_with_reload2.reload
+    assert_raises(ActiveRecord::ReadonlyAttributeError) do
+      post_with_reload2.update(author: author2)
+    end
+
+    post_without_reload = ReadonlyAuthorPost.create!(author: author1, title: "Hi", body: "there")
+    post_without_reload.update(title: "Hello", body: "world")
+    assert_equal author1, post_without_reload.author
+
+    post_without_reload2 = ReadonlyAuthorPost.create!(author: author1, title: "Hi", body: "there")
+    assert_raises(ActiveRecord::ReadonlyAttributeError) do
+      post_without_reload2.update(author: author2)
+    end
   end
 
   def test_unicode_column_name
@@ -652,7 +889,7 @@ class BasicsTest < ActiveRecord::TestCase
     assert_equal "たこ焼き仮面", weird.なまえ
   end
 
-  unless current_adapter?(:PostgreSQLAdapter)
+  unless current_adapter?(:PostgreSQLAdapter) || current_adapter?(:TrilogyAdapter)
     def test_respect_internal_encoding
       old_default_internal = Encoding.default_internal
       silence_warnings { Encoding.default_internal = "EUC-JP" }
@@ -669,12 +906,12 @@ class BasicsTest < ActiveRecord::TestCase
   def test_non_valid_identifier_column_name
     weird = Weird.create("a$b" => "value")
     weird.reload
-    assert_equal "value", weird.send("a$b")
+    assert_equal "value", weird.public_send("a$b")
     assert_equal "value", weird.read_attribute("a$b")
 
     weird.update_columns("a$b" => "value2")
     weird.reload
-    assert_equal "value2", weird.send("a$b")
+    assert_equal "value2", weird.public_send("a$b")
     assert_equal "value2", weird.read_attribute("a$b")
   end
 
@@ -716,9 +953,9 @@ class BasicsTest < ActiveRecord::TestCase
   def test_attributes
     category = Category.new(name: "Ruby")
 
-    expected_attributes = category.attribute_names.map do |attribute_name|
-      [attribute_name, category.public_send(attribute_name)]
-    end.to_h
+    expected_attributes = category.attribute_names.index_with do |attribute_name|
+      category.public_send(attribute_name)
+    end
 
     assert_instance_of Hash, category.attributes
     assert_equal expected_attributes, category.attributes
@@ -727,6 +964,28 @@ class BasicsTest < ActiveRecord::TestCase
   def test_new_record_returns_boolean
     assert_equal false, Topic.new.persisted?
     assert_equal true, Topic.find(1).persisted?
+  end
+
+  def test_previously_new_record_returns_boolean
+    assert_equal false, Topic.new.previously_new_record?
+    assert_equal true, Topic.create.previously_new_record?
+    assert_equal false, Topic.find(1).previously_new_record?
+  end
+
+  def test_previously_new_record_on_destroyed_record
+    topic = Topic.create
+    assert_predicate topic, :previously_new_record?
+
+    topic.destroy
+    assert_not_predicate topic, :previously_new_record?
+  end
+
+  def test_previously_persisted_returns_boolean
+    assert_equal false, Topic.new.previously_persisted?
+    assert_equal false, Topic.new.destroy.previously_persisted?
+    assert_equal false, Topic.first.previously_persisted?
+    assert_equal true, Topic.first.destroy.previously_persisted?
+    assert_equal true, Topic.first.delete.previously_persisted?
   end
 
   def test_dup
@@ -759,6 +1018,14 @@ class BasicsTest < ActiveRecord::TestCase
     assert_equal("c", duped_topic.title)
   end
 
+  def test_dup_for_a_composite_primary_key_model
+    book = cpk_books(:cpk_great_author_first_book)
+    new_book = book.dup
+
+    assert_equal "The first book", new_book.title
+    assert_equal([nil, nil], new_book.id)
+  end
+
   DeveloperSalary = Struct.new(:amount)
   def test_dup_with_aggregate_of_same_name_as_attribute
     developer_with_aggregate = Class.new(ActiveRecord::Base) do
@@ -776,9 +1043,10 @@ class BasicsTest < ActiveRecord::TestCase
     assert_not_predicate dup, :persisted?
 
     # test if the attributes have been duped
-    original_amount = dup.salary.amount
-    dev.salary.amount = 1
-    assert_equal original_amount, dup.salary.amount
+    salary = DeveloperSalary.new(42)
+    dup.salary = salary
+    salary.amount = 1
+    assert_equal 42, dup.salary.amount
 
     assert dup.save
     assert_predicate dup, :persisted?
@@ -821,7 +1089,7 @@ class BasicsTest < ActiveRecord::TestCase
 
   def test_clone_of_new_object_marks_as_dirty_only_changed_attributes
     developer = Developer.new name: "Bjorn"
-    assert developer.name_changed?            # obviously
+    assert_predicate developer, :name_changed?            # obviously
     assert_not developer.salary_changed?         # attribute has non-nil default value, so treated as not changed
 
     cloned_developer = developer.clone
@@ -835,7 +1103,7 @@ class BasicsTest < ActiveRecord::TestCase
     assert_not_predicate developer, :salary_changed?
 
     cloned_developer = developer.dup
-    assert cloned_developer.name_changed?     # both attributes differ from defaults
+    assert_predicate cloned_developer, :name_changed?     # both attributes differ from defaults
     assert_predicate cloned_developer, :salary_changed?
   end
 
@@ -845,7 +1113,7 @@ class BasicsTest < ActiveRecord::TestCase
     assert_not_predicate developer, :salary_changed?
 
     cloned_developer = developer.dup
-    assert cloned_developer.name_changed?     # ... but on cloned object should be
+    assert_predicate cloned_developer, :name_changed?     # ... but on cloned object should be
     assert_not cloned_developer.salary_changed?  # ... BUT salary has non-nil default which should be treated as not changed on cloned instance
   end
 
@@ -862,22 +1130,99 @@ class BasicsTest < ActiveRecord::TestCase
     assert_equal company, Company.find(company.id)
   end
 
-  if current_adapter?(:PostgreSQLAdapter, :Mysql2Adapter, :SQLite3Adapter)
-    def test_default
+  if current_adapter?(:PostgreSQLAdapter, :Mysql2Adapter, :TrilogyAdapter, :SQLite3Adapter)
+    def test_default_char_types
+      default = Default.new
+
+      assert_equal "Y", default.char1
+      assert_equal "a varchar field", default.char2
+
+      # Mysql text type can't have default value
+      unless current_adapter?(:Mysql2Adapter, :TrilogyAdapter)
+        assert_equal "a text field", default.char3
+      end
+    end
+
+    def test_default_in_local_time
       with_timezone_config default: :local do
         default = Default.new
 
-        # fixed dates / times
         assert_equal Date.new(2004, 1, 1), default.fixed_date
         assert_equal Time.local(2004, 1, 1, 0, 0, 0, 0), default.fixed_time
 
-        # char types
-        assert_equal "Y", default.char1
-        assert_equal "a varchar field", default.char2
-        # Mysql text type can't have default value
-        unless current_adapter?(:Mysql2Adapter)
-          assert_equal "a text field", default.char3
+        if current_adapter?(:PostgreSQLAdapter)
+          assert_equal Time.utc(2004, 1, 1, 0, 0, 0, 0), default.fixed_time_with_time_zone
         end
+      end
+    end
+
+    def test_default_in_utc
+      with_timezone_config default: :utc do
+        default = Default.new
+
+        assert_equal Date.new(2004, 1, 1), default.fixed_date
+        assert_equal Time.utc(2004, 1, 1, 0, 0, 0, 0), default.fixed_time
+
+        if current_adapter?(:PostgreSQLAdapter)
+          assert_equal Time.utc(2004, 1, 1, 0, 0, 0, 0), default.fixed_time_with_time_zone
+        end
+      end
+    end
+
+    def test_default_in_utc_with_time_zone
+      with_timezone_config default: :utc do
+        Time.use_zone "Central Time (US & Canada)" do
+          default = Default.new
+
+          assert_equal Date.new(2004, 1, 1), default.fixed_date
+          assert_equal Time.utc(2004, 1, 1, 0, 0, 0, 0), default.fixed_time
+
+          if current_adapter?(:PostgreSQLAdapter)
+            assert_equal Time.utc(2004, 1, 1, 0, 0, 0, 0), default.fixed_time_with_time_zone
+          end
+        end
+      end
+    end
+
+    unless in_memory_db?
+      def test_connection_in_local_time
+        with_timezone_config default: :utc do
+          new_config = ActiveRecord::Base.connection_db_config.configuration_hash.merge(default_timezone: "local")
+          ActiveRecord::Base.establish_connection(new_config)
+          Default.reset_column_information
+
+          default = Default.new
+
+          assert_equal Date.new(2004, 1, 1), default.fixed_date
+          assert_equal Time.local(2004, 1, 1, 0, 0, 0, 0), default.fixed_time
+
+          if current_adapter?(:PostgreSQLAdapter)
+            assert_equal Time.utc(2004, 1, 1, 0, 0, 0, 0), default.fixed_time_with_time_zone
+          end
+        end
+      ensure
+        ActiveRecord::Base.establish_connection :arunit
+        Default.reset_column_information
+      end
+
+      def test_connection_in_utc_time
+        with_timezone_config default: :local do
+          new_config = ActiveRecord::Base.connection_db_config.configuration_hash.merge(default_timezone: "utc")
+          ActiveRecord::Base.establish_connection(new_config)
+          Default.reset_column_information
+
+          default = Default.new
+
+          assert_equal Date.new(2004, 1, 1), default.fixed_date
+          assert_equal Time.utc(2004, 1, 1, 0, 0, 0, 0), default.fixed_time
+
+          if current_adapter?(:PostgreSQLAdapter)
+            assert_equal Time.utc(2004, 1, 1, 0, 0, 0, 0), default.fixed_time_with_time_zone
+          end
+        end
+      ensure
+        ActiveRecord::Base.establish_connection :arunit
+        Default.reset_column_information
       end
     end
   end
@@ -1001,11 +1346,11 @@ class BasicsTest < ActiveRecord::TestCase
 
     klass.table_name = "foo"
     assert_equal "foo", klass.table_name
-    assert_equal klass.connection.quote_table_name("foo"), klass.quoted_table_name
+    assert_equal klass.lease_connection.quote_table_name("foo"), klass.quoted_table_name
 
     klass.table_name = "bar"
     assert_equal "bar", klass.table_name
-    assert_equal klass.connection.quote_table_name("bar"), klass.quoted_table_name
+    assert_equal klass.lease_connection.quote_table_name("bar"), klass.quoted_table_name
   end
 
   def test_set_table_name_with_inheritance
@@ -1080,8 +1425,8 @@ class BasicsTest < ActiveRecord::TestCase
   end
 
   def test_find_keeps_multiple_group_values
-    combined = Developer.all.merge!(group: "developers.name, developers.salary, developers.id, developers.created_at, developers.updated_at, developers.created_on, developers.updated_on").to_a
-    assert_equal combined, Developer.all.merge!(group: ["developers.name", "developers.salary", "developers.id", "developers.created_at", "developers.updated_at", "developers.created_on", "developers.updated_on"]).to_a
+    combined = Developer.merge(group: "developers.name, developers.salary, developers.id, developers.legacy_created_at, developers.legacy_updated_at, developers.legacy_created_on, developers.legacy_updated_on").to_a
+    assert_equal combined, Developer.merge(group: ["developers.name", "developers.salary", "developers.id", "developers.created_at", "developers.updated_at", "developers.created_on", "developers.updated_on"]).to_a
   end
 
   def test_find_symbol_ordered_last
@@ -1105,10 +1450,10 @@ class BasicsTest < ActiveRecord::TestCase
     end
   end
 
-  def test_assert_queries
-    query = lambda { ActiveRecord::Base.connection.execute "select count(*) from developers" }
-    assert_queries(2) { 2.times { query.call } }
-    assert_queries 1, &query
+  def test_assert_queries_count
+    query = lambda { ActiveRecord::Base.lease_connection.execute "select count(*) from developers" }
+    assert_queries_count(2) { 2.times { query.call } }
+    assert_queries_count 1, &query
     assert_no_queries { assert true }
   end
 
@@ -1140,29 +1485,16 @@ class BasicsTest < ActiveRecord::TestCase
 
   def test_clear_cache!
     # preheat cache
-    c1 = Post.connection.schema_cache.columns("posts")
-    assert_not_equal 0, Post.connection.schema_cache.size
+    c1 = Post.schema_cache.columns("posts")
+    assert_not_equal 0, Post.schema_cache.size
 
     ActiveRecord::Base.clear_cache!
-    assert_equal 0, Post.connection.schema_cache.size
+    assert_equal 0, Post.schema_cache.size
 
-    c2 = Post.connection.schema_cache.columns("posts")
-    assert_not_equal 0, Post.connection.schema_cache.size
+    c2 = Post.schema_cache.columns("posts")
+    assert_not_equal 0, Post.schema_cache.size
 
     assert_equal c1, c2
-  end
-
-  def test_current_scope_is_reset
-    Object.const_set :UnloadablePost, Class.new(ActiveRecord::Base)
-    UnloadablePost.send(:current_scope=, UnloadablePost.all)
-
-    UnloadablePost.unloadable
-    klass = UnloadablePost
-    assert_not_nil ActiveRecord::Scoping::ScopeRegistry.value_for(:current_scope, klass)
-    ActiveSupport::Dependencies.remove_unloadable_constants!
-    assert_nil ActiveRecord::Scoping::ScopeRegistry.value_for(:current_scope, klass)
-  ensure
-    Object.class_eval { remove_const :UnloadablePost } if defined?(UnloadablePost)
   end
 
   def test_marshal_round_trip
@@ -1173,11 +1505,21 @@ class BasicsTest < ActiveRecord::TestCase
     assert_equal expected.attributes, actual.attributes
   end
 
+  def test_marshal_inspected_round_trip
+    expected = posts(:welcome)
+    expected.inspect
+
+    marshalled = Marshal.dump(expected)
+    actual = Marshal.load(marshalled)
+
+    assert_equal expected.attributes, actual.attributes
+  end
+
   def test_marshal_new_record_round_trip
     marshalled = Marshal.dump(Post.new)
     post       = Marshal.load(marshalled)
 
-    assert post.new_record?, "should be a new record"
+    assert_predicate post, :new_record?, "should be a new record"
   end
 
   def test_marshalling_with_associations
@@ -1205,7 +1547,7 @@ class BasicsTest < ActiveRecord::TestCase
       rd.binmode
       wr.binmode
 
-      ActiveRecord::Base.connection_handler.clear_all_connections!
+      ActiveRecord::Base.connection_handler.clear_all_connections!(:all)
 
       fork do
         rd.close
@@ -1213,6 +1555,7 @@ class BasicsTest < ActiveRecord::TestCase
         post.comments.build
         wr.write Marshal.dump(post)
         wr.close
+        exit!(0)
       end
 
       wr.close
@@ -1229,11 +1572,11 @@ class BasicsTest < ActiveRecord::TestCase
 
     post = Marshal.load(Marshal.dump(post))
 
-    assert post.new_record?, "should be a new record"
+    assert_predicate post, :new_record?, "should be a new record"
   end
 
   def test_attribute_names
-    expected = ["id", "type", "firm_id", "firm_name", "name", "client_of", "rating", "account_id", "description", "metadata"]
+    expected = ["id", "type", "firm_id", "firm_name", "name", "client_of", "rating", "account_id", "description", "status", "metadata"]
     assert_equal expected, Company.attribute_names
   end
 
@@ -1241,14 +1584,38 @@ class BasicsTest < ActiveRecord::TestCase
     assert Company.has_attribute?("id")
     assert Company.has_attribute?("type")
     assert Company.has_attribute?("name")
+    assert Company.has_attribute?("new_name")
     assert Company.has_attribute?("metadata")
     assert_not Company.has_attribute?("lastname")
     assert_not Company.has_attribute?("age")
+
+    company = Company.new
+    assert company.has_attribute?("id")
+    assert company.has_attribute?("type")
+    assert company.has_attribute?("name")
+    assert company.has_attribute?("new_name")
+    assert company.has_attribute?("metadata")
+    assert_not company.has_attribute?("lastname")
+    assert_not company.has_attribute?("age")
   end
 
   def test_has_attribute_with_symbol
     assert Company.has_attribute?(:id)
+    assert Company.has_attribute?(:type)
+    assert Company.has_attribute?(:name)
+    assert Company.has_attribute?(:new_name)
+    assert Company.has_attribute?(:metadata)
+    assert_not Company.has_attribute?(:lastname)
     assert_not Company.has_attribute?(:age)
+
+    company = Company.new
+    assert company.has_attribute?(:id)
+    assert company.has_attribute?(:type)
+    assert company.has_attribute?(:name)
+    assert company.has_attribute?(:new_name)
+    assert company.has_attribute?(:metadata)
+    assert_not company.has_attribute?(:lastname)
+    assert_not company.has_attribute?(:age)
   end
 
   def test_attribute_names_on_table_not_exists
@@ -1293,30 +1660,15 @@ class BasicsTest < ActiveRecord::TestCase
     assert_equal "t.lo", topic.author_name
   end
 
+  if current_adapter?(:PostgreSQLAdapter)
+    def test_column_types_on_queries_on_postgresql
+      result = ActiveRecord::Base.lease_connection.exec_query("SELECT 1 AS test")
+      assert_equal ActiveModel::Type::Integer, result.column_types["test"].class
+    end
+  end
+
   def test_typecasting_aliases
     assert_equal 10, Topic.select("10 as tenderlove").first.tenderlove
-  end
-
-  def test_slice
-    company = Company.new(rating: 1, name: "37signals", firm_name: "37signals")
-    hash = company.slice(:name, :rating, "arbitrary_method")
-    assert_equal hash[:name], company.name
-    assert_equal hash["name"], company.name
-    assert_equal hash[:rating], company.rating
-    assert_equal hash["arbitrary_method"], company.arbitrary_method
-    assert_equal hash[:arbitrary_method], company.arbitrary_method
-    assert_nil hash[:firm_name]
-    assert_nil hash["firm_name"]
-  end
-
-  def test_slice_accepts_array_argument
-    attrs = {
-      title: "slice",
-      author_name: "@Cohen-Carlisle",
-      content: "accept arrays so I don't have to splat"
-    }.with_indifferent_access
-    topic = Topic.new(attrs)
-    assert_equal attrs, topic.slice(attrs.keys)
   end
 
   def test_default_values_are_deeply_dupped
@@ -1327,6 +1679,7 @@ class BasicsTest < ActiveRecord::TestCase
 
   test "scoped can take a values hash" do
     klass = Class.new(ActiveRecord::Base)
+    klass.table_name = "bar"
     assert_equal ["foo"], klass.all.merge!(select: "foo").select_values
   end
 
@@ -1408,7 +1761,7 @@ class BasicsTest < ActiveRecord::TestCase
   end
 
   test "ignored columns are not present in columns_hash" do
-    cache_columns = Developer.connection.schema_cache.columns_hash(Developer.table_name)
+    cache_columns = Developer.schema_cache.columns_hash(Developer.table_name)
     assert_includes cache_columns.keys, "first_name"
     assert_not_includes Developer.columns_hash.keys, "first_name"
     assert_not_includes SubDeveloper.columns_hash.keys, "first_name"
@@ -1471,6 +1824,10 @@ class BasicsTest < ActiveRecord::TestCase
     assert_equal "Developer: name", loaded_developer.name
   end
 
+  test "when assigning new ignored columns it invalidates cache for column names" do
+    assert_not_includes ColumnNamesCachedDeveloper.column_names, "name"
+  end
+
   test "ignored columns not included in SELECT" do
     query = Developer.all.to_sql.downcase
 
@@ -1505,118 +1862,107 @@ class BasicsTest < ActiveRecord::TestCase
     ActiveRecord::Base.protected_environments = previous_protected_environments
   end
 
-  test "creating a record raises if preventing writes" do
-    error = assert_raises ActiveRecord::ReadOnlyError do
-      ActiveRecord::Base.connection_handler.while_preventing_writes do
-        Bird.create! name: "Bluejay"
-      end
+  test "#present? and #blank? on ActiveRecord::Base classes" do
+    assert_not_empty Topic.all
+    assert_no_queries do
+      assert_predicate Topic, :present?
+      assert_not Topic.blank?
     end
 
-    assert_match %r/\AWrite query attempted while in readonly mode: INSERT /, error.message
-  end
-
-  test "updating a record raises if preventing writes" do
-    bird = Bird.create! name: "Bluejay"
-
-    error = assert_raises ActiveRecord::ReadOnlyError do
-      ActiveRecord::Base.connection_handler.while_preventing_writes do
-        bird.update! name: "Robin"
-      end
-    end
-
-    assert_match %r/\AWrite query attempted while in readonly mode: UPDATE /, error.message
-  end
-
-  test "deleting a record raises if preventing writes" do
-    bird = Bird.create! name: "Bluejay"
-
-    error = assert_raises ActiveRecord::ReadOnlyError do
-      ActiveRecord::Base.connection_handler.while_preventing_writes do
-        bird.destroy!
-      end
-    end
-
-    assert_match %r/\AWrite query attempted while in readonly mode: DELETE /, error.message
-  end
-
-  test "selecting a record does not raise if preventing writes" do
-    bird = Bird.create! name: "Bluejay"
-
-    ActiveRecord::Base.connection_handler.while_preventing_writes do
-      assert_equal bird, Bird.where(name: "Bluejay").first
+    Topic.delete_all
+    assert_no_queries do
+      assert_predicate Topic, :present?
+      assert_not Topic.blank?
     end
   end
 
-  test "an explain query does not raise if preventing writes" do
-    Bird.create!(name: "Bluejay")
+  test "cannot call connects_to on non-abstract or non-ActiveRecord::Base classes" do
+    error = assert_raises(NotImplementedError) do
+      Bird.connects_to(database: { writing: :arunit })
+    end
 
-    ActiveRecord::Base.connection_handler.while_preventing_writes do
-      assert_queries(2) { Bird.where(name: "Bluejay").explain }
+    assert_equal "`connects_to` can only be called on ActiveRecord::Base or abstract classes", error.message
+  end
+
+  test "cannot call connected_to with role and shard on non-abstract classes" do
+    error = assert_raises(NotImplementedError) do
+      Bird.connected_to(role: :reading, shard: :default) { }
+    end
+
+    assert_equal "calling `connected_to` is only allowed on ActiveRecord::Base or abstract classes.", error.message
+  end
+
+  test "can call connected_to with role and shard on abstract classes" do
+    SecondAbstractClass.connected_to(role: :reading, shard: :default) do
+      assert SecondAbstractClass.connected_to?(role: :reading, shard: :default)
     end
   end
 
-  test "an empty transaction does not raise if preventing writes" do
-    ActiveRecord::Base.connection_handler.while_preventing_writes do
-      assert_queries(2, ignore_none: true) do
-        Bird.transaction do
-          ActiveRecord::Base.connection.materialize_transactions
-        end
-      end
+  test "cannot call connected_to on the abstract class that did not establish the connection" do
+    error = assert_raises(NotImplementedError) do
+      ThirdAbstractClass.connected_to(role: :reading) { }
+    end
+
+    assert_equal "calling `connected_to` is only allowed on the abstract class that established the connection.", error.message
+  end
+
+  test "#connecting_to with role" do
+    SecondAbstractClass.connecting_to(role: :reading)
+
+    assert SecondAbstractClass.connected_to?(role: :reading)
+    assert SecondAbstractClass.current_preventing_writes
+  ensure
+    ActiveRecord::Base.connected_to_stack.pop
+  end
+
+  test "#connecting_to with role and shard" do
+    SecondAbstractClass.connecting_to(role: :reading, shard: :default)
+
+    assert SecondAbstractClass.connected_to?(role: :reading, shard: :default)
+  ensure
+    ActiveRecord::Base.connected_to_stack.pop
+  end
+
+  test "#connecting_to with prevent_writes" do
+    SecondAbstractClass.connecting_to(role: :writing, prevent_writes: true)
+
+    assert SecondAbstractClass.connected_to?(role: :writing)
+    assert SecondAbstractClass.current_preventing_writes
+  ensure
+    ActiveRecord::Base.connected_to_stack.pop
+  end
+
+  test "#connected_to_many cannot be called on anything but ActiveRecord::Base" do
+    assert_raises NotImplementedError do
+      SecondAbstractClass.connected_to_many([SecondAbstractClass], role: :writing)
     end
   end
 
-  test "preventing writes applies to all connections on a handler" do
-    conn1_error = assert_raises ActiveRecord::ReadOnlyError do
-      ActiveRecord::Base.connection_handler.while_preventing_writes do
-        assert_equal ActiveRecord::Base.connection, Bird.connection
-        assert_not_equal ARUnit2Model.connection, Bird.connection
-        Bird.create!(name: "Bluejay")
-      end
+  test "#connected_to_many cannot be called with classes that include ActiveRecord::Base" do
+    assert_raises NotImplementedError do
+      ActiveRecord::Base.connected_to_many([ActiveRecord::Base], role: :writing)
     end
-
-    assert_match %r/\AWrite query attempted while in readonly mode: INSERT /, conn1_error.message
-
-    conn2_error = assert_raises ActiveRecord::ReadOnlyError do
-      ActiveRecord::Base.connection_handler.while_preventing_writes do
-        assert_not_equal ActiveRecord::Base.connection, Professor.connection
-        assert_equal ARUnit2Model.connection, Professor.connection
-        Professor.create!(name: "Professor Bluejay")
-      end
-    end
-
-    assert_match %r/\AWrite query attempted while in readonly mode: INSERT /, conn2_error.message
   end
 
-  unless in_memory_db?
-    test "preventing writes with multiple handlers" do
-      ActiveRecord::Base.connects_to(database: { writing: :arunit, reading: :arunit })
+  test "#connected_to_many sets prevent_writes if role is reading" do
+    ActiveRecord::Base.connected_to_many([SecondAbstractClass], role: :reading) do
+      assert SecondAbstractClass.current_preventing_writes
+      assert_not ActiveRecord::Base.current_preventing_writes
+    end
+  end
 
-      conn1_error = assert_raises ActiveRecord::ReadOnlyError do
-        ActiveRecord::Base.connected_to(role: :writing) do
-          assert_equal :writing, ActiveRecord::Base.current_role
+  test "#connected_to_many with a single argument for classes" do
+    ActiveRecord::Base.connected_to_many(SecondAbstractClass, role: :reading) do
+      assert SecondAbstractClass.current_preventing_writes
+      assert_not ActiveRecord::Base.current_preventing_writes
+    end
+  end
 
-          ActiveRecord::Base.connection_handler.while_preventing_writes do
-            Bird.create!(name: "Bluejay")
-          end
-        end
-      end
-
-      assert_match %r/\AWrite query attempted while in readonly mode: INSERT /, conn1_error.message
-
-      conn2_error = assert_raises ActiveRecord::ReadOnlyError do
-        ActiveRecord::Base.connected_to(role: :reading) do
-          assert_equal :reading, ActiveRecord::Base.current_role
-
-          ActiveRecord::Base.connection_handler.while_preventing_writes do
-            Bird.create!(name: "Bluejay")
-          end
-        end
-      end
-
-      assert_match %r/\AWrite query attempted while in readonly mode: INSERT /, conn2_error.message
-    ensure
-      ActiveRecord::Base.connection_handlers = { writing: ActiveRecord::Base.default_connection_handler }
-      ActiveRecord::Base.establish_connection(:arunit)
+  test "#connected_to_many with a multiple classes without brackets works" do
+    ActiveRecord::Base.connected_to_many(FirstAbstractClass, SecondAbstractClass, role: :reading) do
+      assert FirstAbstractClass.current_preventing_writes
+      assert SecondAbstractClass.current_preventing_writes
+      assert_not ActiveRecord::Base.current_preventing_writes
     end
   end
 end

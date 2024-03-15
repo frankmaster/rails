@@ -1,11 +1,12 @@
 # frozen_string_literal: true
 
-require "abstract_unit"
-require "active_support/core_ext/hash"
+require_relative "../abstract_unit"
 require "bigdecimal"
+require "yaml"
+require "active_support/core_ext/hash"
 require "active_support/core_ext/string/access"
-require "active_support/ordered_hash"
 require "active_support/core_ext/object/conversions"
+require "active_support/core_ext/date/conversions"
 require "active_support/core_ext/object/deep_dup"
 require "active_support/inflections"
 
@@ -387,11 +388,13 @@ class HashExtTest < ActiveSupport::TestCase
   def test_extract_nils
     original = { a: nil, b: nil }
     expected = { a: nil }
+    remaining = { b: nil }
     extracted = original.extract!(:a, :x)
 
     assert_equal expected, extracted
     assert_nil extracted[:a]
     assert_nil extracted[:x]
+    assert_equal remaining, original
   end
 
   def test_except
@@ -429,12 +432,6 @@ class HashExtTest < ActiveSupport::TestCase
     original = { a: "x", b: "y" }
     assert_not_called(original, :delete) do
       original.except(:a)
-    end
-  end
-
-  def test_requiring_compact_is_deprecated
-    assert_deprecated do
-      require "active_support/core_ext/hash/compact"
     end
   end
 end
@@ -585,15 +582,6 @@ class HashToXmlTest < ActiveSupport::TestCase
   def test_three_levels_with_array
     xml = { name: "David", addresses: [{ streets: [ { name: "Paulina" }, { name: "Paulina" } ] } ] }.to_xml(@xml_options)
     assert_includes xml, %(<addresses type="array"><address><streets type="array"><street><name>)
-  end
-
-  def test_timezoned_attributes
-    xml = {
-      created_at: Time.utc(1999, 2, 2),
-      local_created_at: Time.utc(1999, 2, 2).in_time_zone("Eastern Time (US & Canada)")
-    }.to_xml(@xml_options)
-    assert_match %r{<created-at type=\"dateTime\">1999-02-02T00:00:00Z</created-at>}, xml
-    assert_match %r{<local-created-at type=\"dateTime\">1999-02-01T19:00:00-05:00</local-created-at>}, xml
   end
 
   def test_multiple_records_from_xml_with_attributes_other_than_type_ignores_them_without_exploding

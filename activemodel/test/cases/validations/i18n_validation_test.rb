@@ -37,7 +37,7 @@ class I18nValidationTest < ActiveModel::TestCase
 
   def test_errors_full_messages_translates_human_attribute_name_for_model_attributes
     @person.errors.add(:name, "not found")
-    assert_called_with(person_class, :human_attribute_name, ["name", default: "Name"], returns: "Person's name") do
+    assert_called_with(person_class, :human_attribute_name, ["name", default: "Name", base: @person], returns: "Person's name") do
       assert_equal ["Person's name not found"], @person.errors.full_messages
     end
   end
@@ -123,8 +123,8 @@ class I18nValidationTest < ActiveModel::TestCase
       errors: { models: { 'person/contacts/addresses': { attributes: { street: { format: "%{message}" } } } } } })
 
     person = person_class.new
-    assert_equal "cannot be blank", person.errors.full_message(:'contacts[0]/addresses[0].street', "cannot be blank")
-    assert_equal "Contacts/addresses country cannot be blank", person.errors.full_message(:'contacts[0]/addresses[0].country', "cannot be blank")
+    assert_equal "cannot be blank", person.errors.full_message(:'contacts[0]/addresses[123].street', "cannot be blank")
+    assert_equal "Contacts/addresses country cannot be blank", person.errors.full_message(:'contacts[0]/addresses[123].country', "cannot be blank")
   end
 
   def test_errors_full_messages_with_indexed_deeply_nested_attributes_and_model_format
@@ -134,8 +134,8 @@ class I18nValidationTest < ActiveModel::TestCase
       errors: { models: { 'person/contacts/addresses': { format: "%{message}" } } } })
 
     person = person_class.new
-    assert_equal "cannot be blank", person.errors.full_message(:'contacts[0]/addresses[0].street', "cannot be blank")
-    assert_equal "cannot be blank", person.errors.full_message(:'contacts[0]/addresses[0].country', "cannot be blank")
+    assert_equal "cannot be blank", person.errors.full_message(:'contacts[0]/addresses[123].street', "cannot be blank")
+    assert_equal "cannot be blank", person.errors.full_message(:'contacts[0]/addresses[123].country', "cannot be blank")
   end
 
   def test_errors_full_messages_with_indexed_deeply_nested_attributes_and_i18n_attribute_name
@@ -146,8 +146,8 @@ class I18nValidationTest < ActiveModel::TestCase
     })
 
     person = person_class.new
-    assert_equal "Contacts/addresses street cannot be blank", person.errors.full_message(:'contacts[0]/addresses[0].street', "cannot be blank")
-    assert_equal "Country cannot be blank", person.errors.full_message(:'contacts[0]/addresses[0].country', "cannot be blank")
+    assert_equal "Contacts/addresses street cannot be blank", person.errors.full_message(:'contacts[0]/addresses[123].street', "cannot be blank")
+    assert_equal "Country cannot be blank", person.errors.full_message(:'contacts[0]/addresses[123].country', "cannot be blank")
   end
 
   def test_errors_full_messages_with_indexed_deeply_nested_attributes_without_i18n_config

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "support/schema_dumping_helper"
+require "pp"
 
 module JSONSharedTestCases
   include SchemaDumpingHelper
@@ -12,7 +13,7 @@ module JSONSharedTestCases
   end
 
   def setup
-    @connection = ActiveRecord::Base.connection
+    @connection = ActiveRecord::Base.lease_connection
   end
 
   def teardown
@@ -146,7 +147,8 @@ module JSONSharedTestCases
     x = klass.new(resolution: "320×480")
     assert_equal "320×480", x.resolution
 
-    y = YAML.load(YAML.dump(x))
+    payload = YAML.dump(x)
+    y = YAML.respond_to?(:unsafe_load) ? YAML.unsafe_load(payload) : YAML.load(payload)
     assert_equal "320×480", y.resolution
   end
 
@@ -218,7 +220,7 @@ module JSONSharedTestCases
 
   def test_not_compatible_with_serialize_json
     new_klass = Class.new(klass) do
-      serialize :payload, JSON
+      serialize :payload, coder: JSON
     end
     assert_raises(ActiveRecord::AttributeMethods::Serialization::ColumnNotSerializableError) do
       new_klass.new
@@ -234,7 +236,7 @@ module JSONSharedTestCases
 
   def test_json_with_serialized_attributes
     new_klass = Class.new(klass) do
-      serialize :settings, MySettings
+      serialize :settings, coder: MySettings
     end
 
     new_klass.create!(settings: MySettings.new("one" => "two"))
@@ -249,13 +251,32 @@ module JSONSharedTestCases
     assert_equal({ "three" => "four" }, record.reload.settings.to_hash)
   end
 
+  class JsonDataTypeWithFilter < ActiveRecord::Base
+    self.table_name = "json_data_type"
+
+    attribute :payload, :json
+
+    def self.filter_attributes
+      # Rails.application.config.filter_parameters += [:password]
+      super + [:password]
+    end
+  end
+
+  def test_pretty_print
+    x = JsonDataTypeWithFilter.create!(payload: {})
+    x.payload[11] = "foo"
+    io = StringIO.new
+    PP.pp(x, io)
+    assert io.string
+  end
+
   private
     def klass
       JsonDataType
     end
 
     def assert_type_match(type, sql_type)
-      native_type = ActiveRecord::Base.connection.native_database_types[type][:name]
+      native_type = ActiveRecord::Base.lease_connection.native_database_types[type][:name]
       assert_match %r(\A#{native_type}\b), sql_type
     end
 

@@ -51,6 +51,15 @@ module ActionMailbox
       assert_equal inbound_email.mail, $processed_mail
     end
 
+    test "single string routing on bcc" do
+      @router.add_routes("first@example.com" => :first)
+
+      inbound_email = create_inbound_email_from_mail(to: "someone@example.com", bcc: "first@example.com", subject: "This is a reply")
+      @router.route inbound_email
+      assert_equal "FirstMailbox", $processed_by
+      assert_equal inbound_email.mail, $processed_mail
+    end
+
     test "single string routing case-insensitively" do
       @router.add_routes("first@example.com" => :first)
 
@@ -123,17 +132,18 @@ module ActionMailbox
     end
 
     test "missing route" do
+      inbound_email = create_inbound_email_from_mail(to: "going-nowhere@example.com", subject: "This is a reply")
       assert_raises(ActionMailbox::Router::RoutingError) do
-        inbound_email = create_inbound_email_from_mail(to: "going-nowhere@example.com", subject: "This is a reply")
         @router.route inbound_email
-        assert inbound_email.bounced?
       end
+      assert_predicate inbound_email, :bounced?
     end
 
     test "invalid address" do
-      assert_raises(ArgumentError) do
+      error = assert_raises(ArgumentError) do
         @router.add_route Array.new, to: :first
       end
+      assert_equal "Expected a Symbol, String, Regexp, Proc, or matchable, got []", error.message
     end
 
     test "single string mailbox_for" do

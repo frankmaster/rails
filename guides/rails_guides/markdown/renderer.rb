@@ -1,18 +1,25 @@
 # frozen_string_literal: true
 
+require "rouge"
+
+# Add more common shell commands
+Rouge::Lexers::Shell::BUILTINS << "|bin/rails|brew|bundle|gem|git|node|rails|rake|ruby|sqlite3|yarn"
+
 module RailsGuides
   class Markdown
-    class Renderer < Redcarpet::Render::HTML
+    class Renderer < Redcarpet::Render::HTML  # :nodoc:
       cattr_accessor :edge, :version
 
       def block_code(code, language)
-        <<-HTML
-<div class="code_container">
-<pre class="brush: #{brush_for(language)}; gutter: false; toolbar: false">
-#{ERB::Util.h(code)}
-</pre>
-</div>
-HTML
+        formatter = Rouge::Formatters::HTML.new
+        lexer = ::Rouge::Lexer.find_fancy(lexer_language(language))
+        formatted_code = formatter.format(lexer.lex(code))
+        <<~HTML
+          <div class="code_container">
+          <pre><code class="highlight #{lexer_language(language)}">#{formatted_code}</code></pre>
+          <button class="clipboard-button" data-clipboard-text="#{clipboard_content(code, language)}">Copy</button>
+          </div>
+        HTML
       end
 
       def link(url, title, content)
@@ -26,9 +33,6 @@ HTML
       end
 
       def header(text, header_level)
-        # Always increase the heading level by 1, so we can use h1, h2 heading in the document
-        header_level += 1
-
         header_with_id = text.scan(/(.*){#(.*)}/)
         unless header_with_id.empty?
           %(<h#{header_level} id="#{header_with_id[0][1].strip}">#{header_with_id[0][0].strip}</h#{header_level}>)
@@ -60,17 +64,33 @@ HTML
           end
         end
 
-        def brush_for(code_type)
+        def lexer_language(code_type)
           case code_type
-          when "ruby", "sql", "plain"
-            code_type
-          when "erb", "html+erb"
-            "ruby; html-script: true"
-          when "html"
-            "xml" # HTML is understood, but there are .xml rules in the CSS
+          when "html+erb"
+            "erb"
+          when "bash"
+            "console"
+          when nil
+            "plaintext"
           else
-            "plain"
+            ::Rouge::Lexer.find(code_type) ? code_type : "plaintext"
           end
+        end
+
+        def clipboard_content(code, language)
+          prompt_regexp =
+            case language
+            when "bash"
+              /^\$ /
+            when "irb"
+              /^irb.*?> /
+            end
+
+          if prompt_regexp
+            code = code.lines.grep(prompt_regexp).join.gsub(prompt_regexp, "")
+          end
+
+          ERB::Util.html_escape(code)
         end
 
         def convert_notes(body)

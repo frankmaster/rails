@@ -4,7 +4,7 @@ require "active_support"
 
 module Rails
   module Command
-    module Behavior #:nodoc:
+    module Behavior # :nodoc:
       extend ActiveSupport::Concern
 
       class_methods do
@@ -44,7 +44,7 @@ module Rails
                   require path
                   return
                 rescue LoadError => e
-                  raise unless e.message =~ /#{Regexp.escape(path)}$/
+                  raise unless /#{Regexp.escape(path)}$/.match?(e.message)
                 rescue Exception => e
                   warn "[WARNING] Could not load #{command_type} #{path.inspect}. Error: #{e.message}.\n#{e.backtrace.join("\n")}"
                 end
@@ -56,7 +56,7 @@ module Rails
           def lookup!
             $LOAD_PATH.each do |base|
               Dir[File.join(base, *file_lookup_paths)].each do |path|
-                path = path.sub("#{base}/", "")
+                path = path.delete_prefix("#{base}/")
                 require path
               rescue Exception
                 # No problem

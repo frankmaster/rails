@@ -26,14 +26,20 @@ class ModelWithAttributes2
 
   attr_accessor :attributes
 
-  attribute_method_suffix "_test"
+  attribute_method_suffix "_test", "_kw"
 
 private
   def attribute(name)
     attributes[name.to_s]
   end
 
-  alias attribute_test attribute
+  def attribute_test(name, attrs = {})
+    attrs[name] = attribute(name)
+  end
+
+  def attribute_kw(name, kw: 1)
+    attribute(name)
+  end
 
   def private_method
     "<3 <3"
@@ -100,8 +106,8 @@ class AttributeMethodsTest < ActiveModel::TestCase
   end
 
   test "unrelated classes should not share attribute method matchers" do
-    assert_not_equal ModelWithAttributes.send(:attribute_method_matchers),
-                     ModelWithAttributes2.send(:attribute_method_matchers)
+    assert_not_equal ModelWithAttributes.public_send(:attribute_method_patterns),
+                     ModelWithAttributes2.public_send(:attribute_method_patterns)
   end
 
   test "#define_attribute_method generates attribute method" do
@@ -111,6 +117,34 @@ class AttributeMethodsTest < ActiveModel::TestCase
     assert_equal "value of foo", ModelWithAttributes.new.foo
   ensure
     ModelWithAttributes.undefine_attribute_methods
+  end
+
+  test "#define_attribute_methods defines alias attribute methods after undefining" do
+    topic_class = Class.new do
+      include ActiveModel::AttributeMethods
+      define_attribute_methods :title
+      alias_attribute :aliased_title_to_be_redefined, :title
+
+      def attributes
+        { title: "Active Model Topic" }
+      end
+
+      private
+        def attribute(name)
+          attributes[name.to_sym]
+        end
+    end
+
+    topic = topic_class.new
+    assert_equal("Active Model Topic", topic.aliased_title_to_be_redefined)
+    topic_class.undefine_attribute_methods
+
+    assert_not_respond_to topic, :aliased_title_to_be_redefined
+
+    topic_class.define_attribute_methods :title
+
+    assert_respond_to topic, :aliased_title_to_be_redefined
+    assert_equal "Active Model Topic", topic.aliased_title_to_be_redefined
   end
 
   test "#define_attribute_method does not generate attribute method if already defined in attribute module" do
@@ -140,7 +174,7 @@ class AttributeMethodsTest < ActiveModel::TestCase
     ModelWithWeirdNamesAttributes.define_attribute_method(:'a?b')
 
     assert_respond_to ModelWithWeirdNamesAttributes.new, :'a?b'
-    assert_equal "value of a?b", ModelWithWeirdNamesAttributes.new.send("a?b")
+    assert_equal "value of a?b", ModelWithWeirdNamesAttributes.new.public_send("a?b")
   ensure
     ModelWithWeirdNamesAttributes.undefine_attribute_methods
   end
@@ -176,7 +210,7 @@ class AttributeMethodsTest < ActiveModel::TestCase
     ModelWithAttributesWithSpaces.define_attribute_methods(:'foo bar')
 
     assert_respond_to ModelWithAttributesWithSpaces.new, :'foo bar'
-    assert_equal "value of foo bar", ModelWithAttributesWithSpaces.new.send(:'foo bar')
+    assert_equal "value of foo bar", ModelWithAttributesWithSpaces.new.public_send(:'foo bar')
   ensure
     ModelWithAttributesWithSpaces.undefine_attribute_methods
   end
@@ -209,12 +243,54 @@ class AttributeMethodsTest < ActiveModel::TestCase
     assert_raises(NoMethodError) { ModelWithAttributes.new.foo }
   end
 
+  test "#undefine_attribute_methods undefines alias attribute methods" do
+    topic_class = Class.new do
+      include ActiveModel::AttributeMethods
+      define_attribute_methods :title
+      alias_attribute :subject_to_be_undefined, :title
+
+      def attributes
+        { title: "Active Model Topic" }
+      end
+
+      private
+        def attribute(name)
+          attributes[name.to_sym]
+        end
+    end
+
+    assert_equal("Active Model Topic", topic_class.new.subject_to_be_undefined)
+    topic_class.undefine_attribute_methods
+
+    assert_raises(NoMethodError, match: /undefined method [`']subject_to_be_undefined'/) do
+      topic_class.new.subject_to_be_undefined
+    end
+  end
+
   test "accessing a suffixed attribute" do
     m = ModelWithAttributes2.new
     m.attributes = { "foo" => "bar" }
+    attrs = {}
 
     assert_equal "bar", m.foo
-    assert_equal "bar", m.foo_test
+    assert_equal "bar", m.foo_kw(kw: 2)
+    assert_equal "bar", m.foo_test(attrs)
+    assert_equal "bar", attrs["foo"]
+  end
+
+  test "defined attribute doesn't expand positional hash argument" do
+    ModelWithAttributes2.define_attribute_methods(:foo)
+
+    m = ModelWithAttributes2.new
+    m.attributes = { "foo" => "bar" }
+    attrs = {}
+
+    assert_equal "bar", m.foo
+    assert_equal "bar", m.foo_kw(kw: 2)
+    assert_equal "bar", m.foo_test(attrs)
+    assert_equal "bar", attrs["foo"]
+  ensure
+    ModelWithAttributes2.undefine_attribute_methods
   end
 
   test "should not interfere with method_missing if the attr has a private/protected method" do
@@ -262,6 +338,37 @@ class AttributeMethodsTest < ActiveModel::TestCase
     match = m.foo_test
 
     assert_equal "foo",            match.attr_name
-    assert_equal "attribute_test", match.target
+    assert_equal "attribute_test", match.proxy_target
+  end
+
+  module NameClash
+    class Model1
+      include ActiveModel::AttributeMethods
+      attribute_method_suffix "_changed?"
+      define_attribute_methods :x
+      attr_accessor :x
+
+      private
+        def attribute_changed?(name)
+          :model_1
+        end
+    end
+
+    class Model2
+      include ActiveModel::AttributeMethods
+      attribute_method_suffix "?"
+      define_attribute_methods :x_changed
+      attr_accessor :x_changed
+
+      private
+        def attribute?(name)
+          :model_2
+        end
+    end
+  end
+
+  test "name clashes are handled" do
+    assert_equal :model_1, NameClash::Model1.new.x_changed?
+    assert_equal :model_2, NameClash::Model2.new.x_changed?
   end
 end

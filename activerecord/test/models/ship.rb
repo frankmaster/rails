@@ -24,7 +24,7 @@ end
 
 class ShipWithoutNestedAttributes < ActiveRecord::Base
   self.table_name = "ships"
-  has_many :prisoners, inverse_of: :ship, foreign_key: :ship_id
+  has_many :prisoners, inverse_of: :ship
   has_many :parts, class_name: "ShipPart", foreign_key: :ship_id
 
   validates :name, presence: true, if: -> { true }
@@ -37,6 +37,6 @@ end
 
 class FamousShip < ActiveRecord::Base
   self.table_name = "ships"
-  belongs_to :famous_pirate
+  belongs_to :famous_pirate, foreign_key: :pirate_id
   validates_presence_of :name, on: :conference
 end

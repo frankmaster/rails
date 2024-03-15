@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+# :markup: markdown
+
 module ActionDispatch
   module SystemTesting
     class Browser # :nodoc:
@@ -7,6 +9,7 @@ module ActionDispatch
 
       def initialize(name)
         @name = name
+        set_default_options
       end
 
       def type
@@ -21,16 +24,7 @@ module ActionDispatch
       end
 
       def options
-        case name
-        when :headless_chrome
-          headless_chrome_browser_options
-        when :headless_firefox
-          headless_firefox_browser_options
-        end
-      end
-
-      def capabilities
-        @option ||=
+        @options ||=
           case type
           when :chrome
             ::Selenium::WebDriver::Chrome::Options.new
@@ -39,41 +33,46 @@ module ActionDispatch
           end
       end
 
-      # driver_path can be configured as a proc. The webdrivers gem uses this
-      # proc to update web drivers. Running this proc early allows us to only
-      # update the webdriver once and avoid race conditions when using
-      # parallel tests.
+      def configure
+        yield options if block_given?
+      end
+
+      # driver_path is lazily initialized by default. Eagerly set it to avoid race
+      # conditions when using parallel tests.
       def preload
         case type
         when :chrome
-          if ::Selenium::WebDriver::Service.respond_to? :driver_path=
-            ::Selenium::WebDriver::Chrome::Service.driver_path.try(:call)
-          else
-            # Selenium <= v3.141.0
-            ::Selenium::WebDriver::Chrome.driver_path
-          end
+          resolve_driver_path(::Selenium::WebDriver::Chrome)
         when :firefox
-          if ::Selenium::WebDriver::Service.respond_to? :driver_path=
-            ::Selenium::WebDriver::Firefox::Service.driver_path.try(:call)
-          else
-            # Selenium <= v3.141.0
-            ::Selenium::WebDriver::Firefox.driver_path
-          end
+          resolve_driver_path(::Selenium::WebDriver::Firefox)
         end
       end
 
       private
-        def headless_chrome_browser_options
-          capabilities.args << "--headless"
-          capabilities.args << "--disable-gpu" if Gem.win_platform?
-
-          capabilities
+        def set_default_options
+          case name
+          when :headless_chrome
+            set_headless_chrome_browser_options
+          when :headless_firefox
+            set_headless_firefox_browser_options
+          end
         end
 
-        def headless_firefox_browser_options
-          capabilities.args << "-headless"
+        def set_headless_chrome_browser_options
+          configure do |capabilities|
+            capabilities.add_argument("--headless")
+            capabilities.add_argument("--disable-gpu") if Gem.win_platform?
+          end
+        end
 
-          capabilities
+        def set_headless_firefox_browser_options
+          configure do |capabilities|
+            capabilities.add_argument("-headless")
+          end
+        end
+
+        def resolve_driver_path(namespace)
+          namespace::Service.driver_path = ::Selenium::WebDriver::DriverFinder.path(options, namespace::Service)
         end
     end
   end

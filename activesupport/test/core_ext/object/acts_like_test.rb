@@ -1,11 +1,24 @@
 # frozen_string_literal: true
 
-require "abstract_unit"
-require "active_support/core_ext/object"
+require_relative "../../abstract_unit"
+require "active_support/core_ext/date/acts_like"
+require "active_support/core_ext/string/behavior"
+require "active_support/core_ext/time/acts_like"
+require "active_support/core_ext/date_time/acts_like"
+require "active_support/core_ext/object/acts_like"
 
 class ObjectTests < ActiveSupport::TestCase
   class DuckTime
     def acts_like_time?
+      true
+    end
+  end
+
+  class Stringish < String
+  end
+
+  class DuckString
+    def acts_like_string?
       true
     end
   end
@@ -31,5 +44,16 @@ class ObjectTests < ActiveSupport::TestCase
 
     assert duck.acts_like?(:time)
     assert_not duck.acts_like?(:date)
+  end
+
+  def test_acts_like_string
+    string = Stringish.new
+    duck_string = DuckString.new
+
+    assert string.acts_like?(:string)
+    assert_not string.acts_like?(:invalid)
+
+    assert duck_string.acts_like?(:string)
+    assert_not duck_string.acts_like?(:invalid)
   end
 end

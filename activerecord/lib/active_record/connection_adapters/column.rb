@@ -63,6 +63,15 @@ module ActiveRecord
         coder["comment"] = @comment
       end
 
+      # whether the column is auto-populated by the database using a sequence
+      def auto_incremented_by_db?
+        false
+      end
+
+      def auto_populated?
+        auto_incremented_by_db? || default_function
+      end
+
       def ==(other)
         other.is_a?(Column) &&
           name == other.name &&
@@ -87,6 +96,10 @@ module ActiveRecord
           comment.hash
       end
 
+      def virtual?
+        false
+      end
+
       private
         def deduplicated
           @name = -name
@@ -100,7 +113,7 @@ module ActiveRecord
     end
 
     class NullColumn < Column
-      def initialize(name)
+      def initialize(name, **)
         super(name, nil)
       end
     end

@@ -27,7 +27,7 @@ module ActionMailbox
   #
   # 2. Generate a strong password that Action Mailbox can use to authenticate requests to the Postmark ingress.
   #
-  #    Use <tt>rails credentials:edit</tt> to add the password to your application's encrypted credentials under
+  #    Use <tt>bin/rails credentials:edit</tt> to add the password to your application's encrypted credentials under
   #    +action_mailbox.ingress_password+, where Action Mailbox will automatically find it:
   #
   #        action_mailbox:
@@ -46,6 +46,7 @@ module ActionMailbox
   #    content in JSON payload"*. Action Mailbox needs the raw email content to work.
   class Ingresses::Postmark::InboundEmailsController < ActionMailbox::BaseController
     before_action :authenticate_by_password
+    param_encoding :create, "RawEmail", Encoding::ASCII_8BIT
 
     def create
       ActionMailbox::InboundEmail.create_and_extract_message_id! params.require("RawEmail")

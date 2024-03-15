@@ -27,7 +27,7 @@ module ActionMailbox
   #
   # 2. Generate a strong password that Action Mailbox can use to authenticate requests to the ingress.
   #
-  #    Use <tt>rails credentials:edit</tt> to add the password to your application's encrypted credentials under
+  #    Use <tt>bin/rails credentials:edit</tt> to add the password to your application's encrypted credentials under
   #    +action_mailbox.ingress_password+, where Action Mailbox will automatically find it:
   #
   #        action_mailbox:
@@ -41,13 +41,13 @@ module ActionMailbox
   #    If your application lives at <tt>https://example.com</tt>, you would configure the Postfix SMTP server to pipe
   #    inbound emails to the following command:
   #
-  #        bin/rails action_mailbox:ingress:postfix URL=https://example.com/rails/action_mailbox/postfix/inbound_emails INGRESS_PASSWORD=...
+  #        $ bin/rails action_mailbox:ingress:postfix URL=https://example.com/rails/action_mailbox/postfix/inbound_emails INGRESS_PASSWORD=...
   #
   #    Built-in ingress commands are available for these popular SMTP servers:
   #
-  #    - Exim (<tt>bin/rails action_mailbox:ingress:exim)
-  #    - Postfix (<tt>bin/rails action_mailbox:ingress:postfix)
-  #    - Qmail (<tt>bin/rails action_mailbox:ingress:qmail)
+  #    - Exim (<tt>bin/rails action_mailbox:ingress:exim</tt>)
+  #    - Postfix (<tt>bin/rails action_mailbox:ingress:postfix</tt>)
+  #    - Qmail (<tt>bin/rails action_mailbox:ingress:qmail</tt>)
   class Ingresses::Relay::InboundEmailsController < ActionMailbox::BaseController
     before_action :authenticate_by_password, :require_valid_rfc822_message
 
@@ -57,7 +57,7 @@ module ActionMailbox
 
     private
       def require_valid_rfc822_message
-        unless request.content_type == "message/rfc822"
+        unless request.media_type == "message/rfc822"
           head :unsupported_media_type
         end
       end

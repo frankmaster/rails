@@ -1,32 +1,22 @@
 # frozen_string_literal: true
 
-require "active_model/forbidden_attributes_protection"
-
 module ActiveRecord
   module AttributeAssignment
-    include ActiveModel::AttributeAssignment
-
     private
       def _assign_attributes(attributes)
-        multi_parameter_attributes  = {}
-        nested_parameter_attributes = {}
+        multi_parameter_attributes = nil
 
         attributes.each do |k, v|
-          if k.include?("(")
-            multi_parameter_attributes[k] = attributes.delete(k)
-          elsif v.is_a?(Hash)
-            nested_parameter_attributes[k] = attributes.delete(k)
+          key = k.to_s
+
+          if key.include?("(")
+            (multi_parameter_attributes ||= {})[key] = v
+          else
+            _assign_attribute(key, v)
           end
         end
-        super(attributes)
 
-        assign_nested_parameter_attributes(nested_parameter_attributes) unless nested_parameter_attributes.empty?
-        assign_multiparameter_attributes(multi_parameter_attributes) unless multi_parameter_attributes.empty?
-      end
-
-      # Assign any deferred nested attributes after the base attributes have been set.
-      def assign_nested_parameter_attributes(pairs)
-        pairs.each { |k, v| _assign_attribute(k, v) }
+        assign_multiparameter_attributes(multi_parameter_attributes) if multi_parameter_attributes
       end
 
       # Instantiates objects for all attribute classes that needs more than one constructor parameter. This is done
@@ -44,7 +34,7 @@ module ActiveRecord
       def execute_callstack_for_multiparameter_attributes(callstack)
         errors = []
         callstack.each do |name, values_with_empty_parameters|
-          if values_with_empty_parameters.each_value.all?(&:nil?)
+          if values_with_empty_parameters.each_value.all?(NilClass)
             values = nil
           else
             values = values_with_empty_parameters

@@ -3,16 +3,32 @@
 module ActiveRecord
   module Associations
     # = Active Record Belongs To Association
-    class BelongsToAssociation < SingularAssociation #:nodoc:
+    class BelongsToAssociation < SingularAssociation # :nodoc:
       def handle_dependency
         return unless load_target
 
         case options[:dependent]
         when :destroy
-          target.destroy
-          raise ActiveRecord::Rollback unless target.destroyed?
+          raise ActiveRecord::Rollback unless target.destroy
+        when :destroy_async
+          if reflection.foreign_key.is_a?(Array)
+            primary_key_column = reflection.active_record_primary_key.map(&:to_sym)
+            id = reflection.foreign_key.map { |col| owner.public_send(col.to_sym) }
+          else
+            primary_key_column = reflection.active_record_primary_key.to_sym
+            id = owner.public_send(reflection.foreign_key.to_sym)
+          end
+
+          enqueue_destroy_association(
+            owner_model_name: owner.class.to_s,
+            owner_id: owner.id,
+            association_class: reflection.klass.to_s,
+            association_ids: [id],
+            association_primary_key_column: primary_key_column,
+            ensuring_owner_was_method: options.fetch(:ensuring_owner_was, nil)
+          )
         else
-          target.send(options[:dependent])
+          target.public_send(options[:dependent])
         end
       end
 
@@ -44,7 +60,8 @@ module ActiveRecord
 
       def decrement_counters_before_last_save
         if reflection.polymorphic?
-          model_was = owner.attribute_before_last_save(reflection.foreign_type).try(:constantize)
+          model_type_was = owner.attribute_before_last_save(reflection.foreign_type)
+          model_was = owner.class.polymorphic_class_for(model_type_was) if model_type_was
         else
           model_was = klass
         end
@@ -57,6 +74,14 @@ module ActiveRecord
       end
 
       def target_changed?
+        owner.attribute_changed?(reflection.foreign_key) || (!foreign_key_present? && target&.new_record?)
+      end
+
+      def target_previously_changed?
+        owner.attribute_previously_changed?(reflection.foreign_key)
+      end
+
+      def saved_change_to_target?
         owner.saved_change_to_attribute?(reflection.foreign_key)
       end
 
@@ -66,9 +91,11 @@ module ActiveRecord
             raise_on_type_mismatch!(record)
             set_inverse_instance(record)
             @updated = true
+          elsif target
+            remove_inverse_instance(target)
           end
 
-          replace_keys(record)
+          replace_keys(record, force: true)
 
           self.target = record
         end
@@ -96,8 +123,15 @@ module ActiveRecord
           reflection.counter_cache_column && owner.persisted?
         end
 
-        def replace_keys(record)
-          owner[reflection.foreign_key] = record ? record._read_attribute(primary_key(record.class)) : nil
+        def replace_keys(record, force: false)
+          target_key_values = record ? Array(primary_key(record.class)).map { |key| record._read_attribute(key) } : []
+          reflection_fk = Array(reflection.foreign_key)
+
+          if force || reflection_fk.map { |fk| owner._read_attribute(fk) } != target_key_values
+            reflection_fk.zip(target_key_values).each do |key, value|
+              owner[key] = value
+            end
+          end
         end
 
         def primary_key(klass)
@@ -105,14 +139,12 @@ module ActiveRecord
         end
 
         def foreign_key_present?
-          owner._read_attribute(reflection.foreign_key)
+          Array(reflection.foreign_key).all? { |fk| owner._read_attribute(fk) }
         end
 
-        # NOTE - for now, we're only supporting inverse setting from belongs_to back onto
-        # has_one associations.
         def invertible_for?(record)
           inverse = inverse_reflection_for(record)
-          inverse && inverse.has_one?
+          inverse && (inverse.has_one? || inverse.klass.has_many_inversing)
         end
 
         def stale_state

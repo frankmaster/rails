@@ -1,6 +1,6 @@
-*   Add `ApplicationMailbox.mailbox_for` to expose mailbox routing.
+*   Fix all Action Mailbox database related models to respect
+    `ActiveRecord::Base.table_name_prefix` configuration.
 
-    *James Dabbs*
+    *Chedli Bourguiba*
 
-
-Please check [6-0-stable](https://github.com/rails/rails/blob/6-0-stable/actionmailbox/CHANGELOG.md) for previous changes.
+Please check [7-1-stable](https://github.com/rails/rails/blob/7-1-stable/actionmailbox/CHANGELOG.md) for previous changes.

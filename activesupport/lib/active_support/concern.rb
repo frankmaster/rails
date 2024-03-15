@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 module ActiveSupport
+  # = Active Support \Concern
+  #
   # A typical module looks like this:
   #
   #   module M
@@ -16,10 +18,10 @@ module ActiveSupport
   #     end
   #   end
   #
-  # By using <tt>ActiveSupport::Concern</tt> the above module could instead be
+  # By using +ActiveSupport::Concern+ the above module could instead be
   # written as:
   #
-  #   require 'active_support/concern'
+  #   require "active_support/concern"
   #
   #   module M
   #     extend ActiveSupport::Concern
@@ -73,10 +75,10 @@ module ActiveSupport
   #   end
   #
   # Unfortunately this won't work, since when +Foo+ is included, its <tt>base</tt>
-  # is the +Bar+ module, not the +Host+ class. With <tt>ActiveSupport::Concern</tt>,
+  # is the +Bar+ module, not the +Host+ class. With +ActiveSupport::Concern+,
   # module dependencies are properly resolved:
   #
-  #   require 'active_support/concern'
+  #   require "active_support/concern"
   #
   #   module Foo
   #     extend ActiveSupport::Concern
@@ -99,18 +101,32 @@ module ActiveSupport
   #   class Host
   #     include Bar # It works, now Bar takes care of its dependencies
   #   end
+  #
+  # === Prepending concerns
+  #
+  # Just like <tt>include</tt>, concerns also support <tt>prepend</tt> with a corresponding
+  # <tt>prepended do</tt> callback. <tt>module ClassMethods</tt> or <tt>class_methods do</tt> are
+  # prepended as well.
+  #
+  # <tt>prepend</tt> is also used for any dependencies.
   module Concern
-    class MultipleIncludedBlocks < StandardError #:nodoc:
+    class MultipleIncludedBlocks < StandardError # :nodoc:
       def initialize
         super "Cannot define multiple 'included' blocks for a Concern"
       end
     end
 
-    def self.extended(base) #:nodoc:
+    class MultiplePrependBlocks < StandardError # :nodoc:
+      def initialize
+        super "Cannot define multiple 'prepended' blocks for a Concern"
+      end
+    end
+
+    def self.extended(base) # :nodoc:
       base.instance_variable_set(:@_dependencies, [])
     end
 
-    def append_features(base) #:nodoc:
+    def append_features(base) # :nodoc:
       if base.instance_variable_defined?(:@_dependencies)
         base.instance_variable_get(:@_dependencies) << self
         false
@@ -120,6 +136,19 @@ module ActiveSupport
         super
         base.extend const_get(:ClassMethods) if const_defined?(:ClassMethods)
         base.class_eval(&@_included_block) if instance_variable_defined?(:@_included_block)
+      end
+    end
+
+    def prepend_features(base) # :nodoc:
+      if base.instance_variable_defined?(:@_dependencies)
+        base.instance_variable_get(:@_dependencies).unshift self
+        false
+      else
+        return false if base < self
+        @_dependencies.each { |dep| base.prepend(dep) }
+        super
+        base.singleton_class.prepend const_get(:ClassMethods) if const_defined?(:ClassMethods)
+        base.class_eval(&@_prepended_block) if instance_variable_defined?(:@_prepended_block)
       end
     end
 
@@ -134,6 +163,23 @@ module ActiveSupport
           end
         else
           @_included_block = block
+        end
+      else
+        super
+      end
+    end
+
+    # Evaluate given block in context of base class,
+    # so that you can write class macros here.
+    # When you define more than one +prepended+ block, it raises an exception.
+    def prepended(base = nil, &block)
+      if base.nil?
+        if instance_variable_defined?(:@_prepended_block)
+          if @_prepended_block.source_location != block.source_location
+            raise MultiplePrependBlocks
+          end
+        else
+          @_prepended_block = block
         end
       else
         super

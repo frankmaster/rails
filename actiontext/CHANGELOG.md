@@ -1,21 +1,43 @@
-*   The `fill_in_rich_text_area` system test helper locates a Trix editor and fills it in with the given HTML:
+*   Use `includes` instead of `eager_load` for `with_all_rich_text`.
+
+    *Petrik de Heus*
+
+*   Delegate `ActionText::Content#deconstruct` to `Nokogiri::XML::DocumentFragment#elements`
 
     ```ruby
-    # <trix-editor id="message_content" ...></trix-editor>
-    fill_in_rich_text_area "message_content", with: "Hello <em>world!</em>"
+    content = ActionText::Content.new <<~HTML
+      <h1>Hello, world</h1>
 
-    # <trix-editor placeholder="Your message here" ...></trix-editor>
-    fill_in_rich_text_area "Your message here", with: "Hello <em>world!</em>"
+      <div>The body</div>
+    HTML
 
-    # <trix-editor aria-label="Message content" ...></trix-editor>
-    fill_in_rich_text_area "Message content", with: "Hello <em>world!</em>"
+    content => [h1, div]
 
-    # <input id="trix_input_1" name="message[content]" type="hidden">
-    # <trix-editor input="trix_input_1"></trix-editor>
-    fill_in_rich_text_area "message[content]", with: "Hello <em>world!</em>"
+    assert_pattern { h1 => { content: "Hello, world" } }
+    assert_pattern { div => { content: "The body" } }
     ```
 
-    *George Claghorn*
+    *Sean Doyle*
 
+*   Fix all Action Text database related models to respect
+    `ActiveRecord::Base.table_name_prefix` configuration.
 
-Please check [6-0-stable](https://github.com/rails/rails/blob/6-0-stable/actiontext/CHANGELOG.md) for previous changes.
+    *Chedli Bourguiba*
+
+*   Compile ESM package that can be used directly in the browser as actiontext.esm.js
+
+    *Matias Grunberg*
+
+*   Fix using actiontext.js with Sprockets
+
+    *Matias Grunberg*
+
+*   Upgrade Trix to 2.0.7
+
+    *Hartley McGuire*
+
+*   Fix using Trix with Sprockets
+
+    *Hartley McGuire*
+
+Please check [7-1-stable](https://github.com/rails/rails/blob/7-1-stable/actiontext/CHANGELOG.md) for previous changes.

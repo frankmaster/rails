@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "cases/helper"
+require "active_support/json"
 
 class DirtyTest < ActiveModel::TestCase
   class DirtyModel
@@ -38,10 +39,6 @@ class DirtyTest < ActiveModel::TestCase
 
     def save
       changes_applied
-    end
-
-    def reload
-      clear_changes_information
     end
   end
 
@@ -153,6 +150,17 @@ class DirtyTest < ActiveModel::TestCase
     assert_predicate @model, :name_previously_changed?
   end
 
+  test "checking if an attribute was previously changed to a particular value" do
+    @model.name = "Ringo"
+    @model.save
+    assert @model.name_previously_changed?(from: nil, to: "Ringo")
+    assert_not @model.name_previously_changed?(from: "Pete", to: "Ringo")
+    assert @model.name_previously_changed?(to: "Ringo")
+    assert_not @model.name_previously_changed?(to: "Pete")
+    assert @model.name_previously_changed?(from: nil)
+    assert_not @model.name_previously_changed?(from: "Pete")
+  end
+
   test "previous value is preserved when changed after save" do
     assert_equal({}, @model.changed_attributes)
     @model.name = "Paul"
@@ -176,7 +184,7 @@ class DirtyTest < ActiveModel::TestCase
     @model.status = "finished"
     assert_equal ["Otto", "Mr. Manfredgensonton"], @model.name_change
     assert_equal ["waiting", "finished"], @model.status_change
-    assert_equal @model.name_was, "Otto"
+    assert_equal "Otto", @model.name_was
   end
 
   test "using attribute_will_change! with a symbol" do
@@ -184,7 +192,7 @@ class DirtyTest < ActiveModel::TestCase
     assert_predicate @model, :size_changed?
   end
 
-  test "reload should reset all changes" do
+  test "clear_changes_information should reset all changes" do
     @model.name = "Dmitry"
     @model.name_changed?
     @model.save
@@ -193,7 +201,7 @@ class DirtyTest < ActiveModel::TestCase
     assert_equal [nil, "Dmitry"], @model.previous_changes["name"]
     assert_equal "Dmitry", @model.changed_attributes["name"]
 
-    @model.reload
+    @model.clear_changes_information
 
     assert_equal ActiveSupport::HashWithIndifferentAccess.new, @model.previous_changes
     assert_equal ActiveSupport::HashWithIndifferentAccess.new, @model.changed_attributes
@@ -229,5 +237,26 @@ class DirtyTest < ActiveModel::TestCase
 
   test "model can be dup-ed without Attributes" do
     assert @model.dup
+  end
+
+  test "to_json should work on model" do
+    @model.name = "Dmitry"
+    assert_equal "{\"name\":\"Dmitry\",\"color\":null,\"size\":null,\"status\":\"initialized\"}", @model.to_json
+  end
+
+  test "to_json should work on model with :except string option" do
+    @model.name = "Dmitry"
+    assert_equal "{\"color\":null,\"size\":null,\"status\":\"initialized\"}", @model.to_json(except: "name")
+  end
+
+  test "to_json should work on model with :except array option" do
+    @model.name = "Dmitry"
+    assert_equal "{\"color\":null,\"size\":null,\"status\":\"initialized\"}", @model.to_json(except: ["name"])
+  end
+
+  test "to_json should work on model after save" do
+    @model.name = "Dmitry"
+    @model.save
+    assert_equal "{\"name\":\"Dmitry\",\"color\":null,\"size\":null,\"status\":\"initialized\"}", @model.to_json
   end
 end

@@ -4,7 +4,11 @@ module ActiveStorage
   class Previewer::MuPDFPreviewer < Previewer
     class << self
       def accept?(blob)
-        blob.content_type == "application/pdf" && mutool_exists?
+        pdf?(blob.content_type) && mutool_exists?
+      end
+
+      def pdf?(content_type)
+        Marcel::Magic.child? content_type, "application/pdf"
       end
 
       def mutool_path
@@ -20,10 +24,10 @@ module ActiveStorage
       end
     end
 
-    def preview
+    def preview(**options)
       download_blob_to_tempfile do |input|
         draw_first_page_from input do |output|
-          yield io: output, filename: "#{blob.filename.base}.png", content_type: "image/png"
+          yield io: output, filename: "#{blob.filename.base}.png", content_type: "image/png", **options
         end
       end
     end

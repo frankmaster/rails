@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 module ActionMailer
+  # = Action Mailer \Parameterized
+  #
   # Provides the option to parameterize mailers in order to share instance variable
   # setup, processing, and common headers.
   #
@@ -88,7 +90,11 @@ module ActionMailer
     extend ActiveSupport::Concern
 
     included do
-      attr_accessor :params
+      attr_writer :params
+
+      def params
+        @params ||= {}
+      end
     end
 
     module ClassMethods
@@ -108,9 +114,9 @@ module ActionMailer
       end
 
       private
-        def method_missing(method_name, *args)
-          if @mailer.action_methods.include?(method_name.to_s)
-            ActionMailer::Parameterized::MessageDelivery.new(@mailer, method_name, @params, *args)
+        def method_missing(method_name, ...)
+          if @mailer.action_methods.include?(method_name.name)
+            ActionMailer::Parameterized::MessageDelivery.new(@mailer, method_name, @params, ...)
           else
             super
           end
@@ -121,15 +127,9 @@ module ActionMailer
         end
     end
 
-    class DeliveryJob < ActionMailer::DeliveryJob # :nodoc:
-      def perform(mailer, mail_method, delivery_method, params, *args)
-        mailer.constantize.with(params).public_send(mail_method, *args).send(delivery_method)
-      end
-    end
-
     class MessageDelivery < ActionMailer::MessageDelivery # :nodoc:
-      def initialize(mailer_class, action, params, *args)
-        super(mailer_class, action, *args)
+      def initialize(mailer_class, action, params, ...)
+        super(mailer_class, action, ...)
         @params = params
       end
 
@@ -145,25 +145,8 @@ module ActionMailer
           if processed?
             super
           else
-            job  = delivery_job_class
-            args = arguments_for(job, delivery_method)
-            job.set(options).perform_later(*args)
-          end
-        end
-
-        def delivery_job_class
-          if @mailer_class.delivery_job <= MailDeliveryJob
-            @mailer_class.delivery_job
-          else
-            Parameterized::DeliveryJob
-          end
-        end
-
-        def arguments_for(delivery_job, delivery_method)
-          if delivery_job <= MailDeliveryJob
-            [@mailer_class.name, @action.to_s, delivery_method.to_s, params: @params, args: @args]
-          else
-            [@mailer_class.name, @action.to_s, delivery_method.to_s, @params, *@args]
+            @mailer_class.delivery_job.set(options).perform_later(
+              @mailer_class.name, @action.to_s, delivery_method.to_s, params: @params, args: @args)
           end
         end
     end

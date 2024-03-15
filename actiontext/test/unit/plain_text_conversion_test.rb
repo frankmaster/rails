@@ -52,6 +52,27 @@ class ActionText::PlainTextConversionTest < ActiveSupport::TestCase
     )
   end
 
+  test "basic nested <ul> tags are indented" do
+    assert_converted_to(
+      "• Item 1\n  • Item 2",
+      "<ul><li>Item 1<ul><li>Item 2</li></ul></li></ul>"
+    )
+  end
+
+  test "basic nested <ol> tags are indented" do
+    assert_converted_to(
+      "1. Item 1\n  1. Item 2",
+      "<ol><li>Item 1<ol><li>Item 2</li></ol></li></ol>"
+    )
+  end
+
+  test "complex nested / mixed list tags are indented" do
+    assert_converted_to(
+      "• Item 0\n• Item 1\n  • Item A\n    1. Item i\n    2. Item ii\n  • Item B\n    • Item i\n• Item 2",
+      "<ul><li>Item 0</li><li>Item 1<ul><li>Item A<ol><li>Item i</li><li>Item ii</li></ol></li><li>Item B<ul><li>Item i</li></ul></li></ul></li><li>Item 2</li></ul>"
+    )
+  end
+
   test "<br> tags are separated by one new line" do
     assert_converted_to(
       "Hello world!\none\ntwo\nthree",
@@ -66,10 +87,32 @@ class ActionText::PlainTextConversionTest < ActiveSupport::TestCase
     )
   end
 
+  test "<figcaption> tags are converted to their plain-text representation" do
+    assert_converted_to(
+      "Hello world! [A condor in the mountain]",
+      "Hello world! <figcaption>A condor in the mountain</figcaption>"
+    )
+  end
+
   test "<action-text-attachment> tags are converted to their plain-text representation" do
     assert_converted_to(
       "Hello world! [Cat]",
       'Hello world! <action-text-attachment url="http://example.com/cat.jpg" content-type="image" caption="Cat"></action-text-attachment>'
+    )
+  end
+
+  test "deeply nested tags are converted" do
+    assert_converted_to(
+      "Hello world!\nHow are you?",
+      ActionText::Fragment.wrap("<div>Hello world!</div><div></div>").tap do |fragment|
+        node = fragment.source.children.last
+        1_000.times do
+          child = node.clone
+          child.parent = node
+          node = child
+        end
+        node.inner_html = "How are you?"
+      end
     )
   end
 

@@ -21,12 +21,12 @@ module ActiveRecord
     # On the other hand, we want to monitor the performance of our real database
     # queries, not the performance of the access to the query cache.
     IGNORED_PAYLOADS = %w(SCHEMA EXPLAIN)
-    EXPLAINED_SQLS = /\A\s*(with|select|update|delete|insert)\b/i
+    EXPLAINED_SQLS = /\A\s*(\/\*.*\*\/)?\s*(with|select|update|delete|insert)\b/i
     def ignore_payload?(payload)
       payload[:exception] ||
         payload[:cached] ||
         IGNORED_PAYLOADS.include?(payload[:name]) ||
-        payload[:sql] !~ EXPLAINED_SQLS
+        !payload[:sql].match?(EXPLAINED_SQLS)
     end
 
     ActiveSupport::Notifications.subscribe("sql.active_record", new)

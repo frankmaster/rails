@@ -1,9 +1,26 @@
 # frozen_string_literal: true
 
-require "mutex_m"
+require "active_support/core_ext/module/delegation"
 
 module ActiveRecord
   module Delegation # :nodoc:
+    class << self
+      def delegated_classes
+        [
+          ActiveRecord::Relation,
+          ActiveRecord::Associations::CollectionProxy,
+          ActiveRecord::AssociationRelation,
+          ActiveRecord::DisableJoinsAssociationRelation,
+        ]
+      end
+
+      def uncacheable_methods
+        @uncacheable_methods ||= (
+          delegated_classes.flat_map(&:public_instance_methods) - ActiveRecord::Relation.public_instance_methods
+        ).to_set.freeze
+      end
+    end
+
     module DelegateCache # :nodoc:
       def relation_delegate_class(klass)
         @relation_delegate_cache[klass]
@@ -11,11 +28,7 @@ module ActiveRecord
 
       def initialize_relation_delegate_cache
         @relation_delegate_cache = cache = {}
-        [
-          ActiveRecord::Relation,
-          ActiveRecord::Associations::CollectionProxy,
-          ActiveRecord::AssociationRelation
-        ].each do |klass|
+        Delegation.delegated_classes.each do |klass|
           delegate = Class.new(klass) {
             include ClassSpecificRelation
           }
@@ -53,21 +66,21 @@ module ActiveRecord
     end
 
     class GeneratedRelationMethods < Module # :nodoc:
-      include Mutex_m
+      MUTEX = Mutex.new
 
       def generate_method(method)
-        synchronize do
+        MUTEX.synchronize do
           return if method_defined?(method)
 
-          if /\A[a-zA-Z_]\w*[!?]?\z/.match?(method)
+          if /\A[a-zA-Z_]\w*[!?]?\z/.match?(method) && !::ActiveSupport::Delegation::RESERVED_METHOD_NAMES.include?(method.to_s)
             module_eval <<-RUBY, __FILE__, __LINE__ + 1
-              def #{method}(*args, &block)
-                scoping { klass.#{method}(*args, &block) }
+              def #{method}(...)
+                scoping { klass.#{method}(...) }
               end
             RUBY
           else
-            define_method(method) do |*args, &block|
-              scoping { klass.public_send(method, *args, &block) }
+            define_method(method) do |*args, **kwargs, &block|
+              scoping { klass.public_send(method, *args, **kwargs, &block) }
             end
           end
         end
@@ -82,12 +95,12 @@ module ActiveRecord
     # may vary depending on the klass of a relation, so we create a subclass of Relation
     # for each different klass, and the delegations are compiled into that subclass only.
 
-    delegate :to_xml, :encode_with, :length, :each, :join,
+    delegate :to_xml, :encode_with, :length, :each, :join, :intersect?,
              :[], :&, :|, :+, :-, :sample, :reverse, :rotate, :compact, :in_groups, :in_groups_of,
-             :to_sentence, :to_formatted_s, :as_json,
+             :to_sentence, :to_fs, :to_formatted_s, :as_json,
              :shuffle, :split, :slice, :index, :rindex, to: :records
 
-    delegate :primary_key, :connection, to: :klass
+    delegate :primary_key, :connection, :transaction, to: :klass
 
     module ClassSpecificRelation # :nodoc:
       extend ActiveSupport::Concern
@@ -99,10 +112,12 @@ module ActiveRecord
       end
 
       private
-        def method_missing(method, *args, &block)
+        def method_missing(method, ...)
           if @klass.respond_to?(method)
-            @klass.generate_relation_method(method)
-            scoping { @klass.public_send(method, *args, &block) }
+            unless Delegation.uncacheable_methods.include?(method)
+              @klass.generate_relation_method(method)
+            end
+            scoping { @klass.public_send(method, ...) }
           else
             super
           end
@@ -110,8 +125,8 @@ module ActiveRecord
     end
 
     module ClassMethods # :nodoc:
-      def create(klass, *args)
-        relation_class_for(klass).new(klass, *args)
+      def create(klass, *args, **kwargs)
+        relation_class_for(klass).new(klass, *args, **kwargs)
       end
 
       private

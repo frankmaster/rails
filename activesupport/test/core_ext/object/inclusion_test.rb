@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-require "abstract_unit"
+require_relative "../../abstract_unit"
 require "active_support/core_ext/object/inclusion"
 
 class InTest < ActiveSupport::TestCase
@@ -30,6 +30,11 @@ class InTest < ActiveSupport::TestCase
     s = Set.new([1, 2])
     assert 1.in?(s)
     assert_not 3.in?(s)
+  end
+
+  def test_in_date_range
+    assert Date.today.in?(..Date.tomorrow)
+    assert_not Date.today.in?(Date.tomorrow..)
   end
 
   module A

@@ -1,16 +1,24 @@
 # frozen_string_literal: true
 
-require "abstract_unit"
+require_relative "../../abstract_unit"
 require "active_support/cache"
 require_relative "../behaviors"
 require "pathname"
 
 class FileStoreTest < ActiveSupport::TestCase
+  attr_reader :cache_dir
+
+  def lookup_store(options = {})
+    cache_dir = options.delete(:cache_dir) { @cache_dir }
+    ActiveSupport::Cache.lookup_store(:file_store, cache_dir, options)
+  end
+
   def setup
+    @cache_dir = Dir.mktmpdir("file-store-")
     Dir.mkdir(cache_dir) unless File.exist?(cache_dir)
-    @cache = ActiveSupport::Cache.lookup_store(:file_store, cache_dir, expires_in: 60)
-    @peek = ActiveSupport::Cache.lookup_store(:file_store, cache_dir, expires_in: 60)
-    @cache_with_pathname = ActiveSupport::Cache.lookup_store(:file_store, Pathname.new(cache_dir), expires_in: 60)
+    @cache = lookup_store(expires_in: 60)
+    @peek = lookup_store(expires_in: 60)
+    @cache_with_pathname = lookup_store(cache_dir: Pathname.new(cache_dir), expires_in: 60)
 
     @buffer = StringIO.new
     @cache.logger = ActiveSupport::Logger.new(@buffer)
@@ -21,17 +29,16 @@ class FileStoreTest < ActiveSupport::TestCase
   rescue Errno::ENOENT
   end
 
-  def cache_dir
-    File.join(Dir.pwd, "tmp_cache")
-  end
-
   include CacheStoreBehavior
   include CacheStoreVersionBehavior
-  include LocalCacheBehavior
+  include CacheStoreCoderBehavior
+  include CacheStoreCompressionBehavior
+  include CacheStoreSerializerBehavior
+  include CacheStoreFormatVersionBehavior
   include CacheDeleteMatchedBehavior
   include CacheIncrementDecrementBehavior
   include CacheInstrumentationBehavior
-  include AutoloadingCacheBehavior
+  include CacheLoggingBehavior
 
   def test_clear
     gitkeep = File.join(cache_dir, ".gitkeep")
@@ -44,7 +51,7 @@ class FileStoreTest < ActiveSupport::TestCase
 
   def test_clear_without_cache_dir
     FileUtils.rm_r(cache_dir)
-    @cache.clear
+    assert_nothing_raised { @cache.clear }
   end
 
   def test_long_uri_encoded_keys
@@ -84,6 +91,18 @@ class FileStoreTest < ActiveSupport::TestCase
     assert_equal "B", File.basename(path)
   end
 
+  def test_delete_matched_when_key_exceeds_max_filename_size
+    submaximal_key = "_" * (ActiveSupport::Cache::FileStore::FILENAME_MAX_SIZE - 1)
+
+    @cache.write(submaximal_key + "AB", "value")
+    @cache.delete_matched(/AB/)
+    assert_not @cache.exist?(submaximal_key + "AB")
+
+    @cache.write(submaximal_key + "/A", "value")
+    @cache.delete_matched(/A/)
+    assert_not @cache.exist?(submaximal_key + "/A")
+  end
+
   # If nothing has been stored in the cache, there is a chance the cache directory does not yet exist
   # Ensure delete_matched gracefully handles this case
   def test_delete_matched_when_cache_directory_does_not_exist
@@ -106,7 +125,7 @@ class FileStoreTest < ActiveSupport::TestCase
 
   def test_log_exception_when_cache_read_fails
     File.stub(:exist?, -> { raise StandardError.new("failed") }) do
-      @cache.send(:read_entry, "winston", {})
+      @cache.send(:read_entry, "winston", **{})
       assert_predicate @buffer.string, :present?
     end
   end
@@ -125,10 +144,23 @@ class FileStoreTest < ActiveSupport::TestCase
     end
   end
 
+  def test_cleanup_when_non_active_support_cache_file_exists
+    cache_file_path = @cache.send(:normalize_key, "foo", nil)
+    FileUtils.makedirs(File.dirname(cache_file_path))
+    File.atomic_write(cache_file_path, cache_dir) { |f| Marshal.dump({ "foo": "bar" }, f) }
+    assert_nothing_raised { @cache.cleanup }
+    assert_equal 1, Dir.glob(File.join(cache_dir, "**")).size
+  end
+
   def test_write_with_unless_exist
     assert_equal true, @cache.write(1, "aaaaaaaaaa")
     assert_equal false, @cache.write(1, "aaaaaaaaaa", unless_exist: true)
     @cache.write(1, nil)
     assert_equal false, @cache.write(1, "aaaaaaaaaa", unless_exist: true)
   end
+
+  private
+    def key_pattern(key, namespace: nil)
+      /.+\/#{Regexp.escape namespace.to_s}#{/%3A/i if namespace}#{Regexp.escape key}/
+    end
 end

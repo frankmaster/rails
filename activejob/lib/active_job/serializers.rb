@@ -3,18 +3,24 @@
 require "set"
 
 module ActiveJob
-  # The <tt>ActiveJob::Serializers</tt> module is used to store a list of known serializers
+  # = Active Job \Serializers
+  #
+  # The +ActiveJob::Serializers+ module is used to store a list of known serializers
   # and to add new ones. It also has helpers to serialize/deserialize objects.
   module Serializers # :nodoc:
     extend ActiveSupport::Autoload
 
     autoload :ObjectSerializer
+    autoload :TimeObjectSerializer
     autoload :SymbolSerializer
     autoload :DurationSerializer
     autoload :DateTimeSerializer
     autoload :DateSerializer
     autoload :TimeWithZoneSerializer
     autoload :TimeSerializer
+    autoload :ModuleSerializer
+    autoload :RangeSerializer
+    autoload :BigDecimalSerializer
 
     mattr_accessor :_additional_serializers
     self._additional_serializers = Set.new
@@ -22,7 +28,7 @@ module ActiveJob
     class << self
       # Returns serialized representative of the passed object.
       # Will look up through all known serializers.
-      # Raises <tt>ActiveJob::SerializationError</tt> if it can't find a proper serializer.
+      # Raises ActiveJob::SerializationError if it can't find a proper serializer.
       def serialize(argument)
         serializer = serializers.detect { |s| s.serialize?(argument) }
         raise SerializationError.new("Unsupported argument type: #{argument.class.name}") unless serializer
@@ -58,6 +64,9 @@ module ActiveJob
       DateTimeSerializer,
       DateSerializer,
       TimeWithZoneSerializer,
-      TimeSerializer
+      TimeSerializer,
+      ModuleSerializer,
+      RangeSerializer,
+      BigDecimalSerializer
   end
 end

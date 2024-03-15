@@ -1,11 +1,15 @@
 # frozen_string_literal: true
 
 module ActiveStorage
-  class Attached::Changes::DeleteMany #:nodoc:
+  class Attached::Changes::DeleteMany # :nodoc:
     attr_reader :name, :record
 
     def initialize(name, record)
       @name, @record = name, record
+    end
+
+    def attachables
+      []
     end
 
     def attachments

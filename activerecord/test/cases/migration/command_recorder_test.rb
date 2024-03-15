@@ -6,7 +6,7 @@ module ActiveRecord
   class Migration
     class CommandRecorderTest < ActiveRecord::TestCase
       def setup
-        connection = ActiveRecord::Base.connection
+        connection = ActiveRecord::Base.lease_connection
         @recorder  = CommandRecorder.new(connection)
       end
 
@@ -33,9 +33,13 @@ module ActiveRecord
       end
 
       def test_unknown_commands_delegate
-        recorder = Struct.new(:foo)
-        recorder = CommandRecorder.new(recorder.new("bar"))
-        assert_equal "bar", recorder.foo
+        recorder = Class.new do
+          def foo(kw:)
+            kw
+          end
+        end
+        recorder = CommandRecorder.new(recorder.new)
+        assert_equal "bar", recorder.foo(kw: "bar")
       end
 
       def test_inverse_of_raise_exception_on_unknown_commands
@@ -94,9 +98,10 @@ module ActiveRecord
             t.rename :kind, :cultivar
           end
         end
+
         assert_equal [
           [:rename_column, [:fruits, :cultivar, :kind]],
-          [:remove_column, [:fruits, :name, :string, {}], nil],
+          [:remove_column, [:fruits, :name, :string], nil],
         ], @recorder.commands
 
         assert_raises(ActiveRecord::IrreversibleMigration) do
@@ -108,12 +113,44 @@ module ActiveRecord
         end
       end
 
+      if ActiveRecord::Base.lease_connection.supports_bulk_alter?
+        def test_bulk_invert_change_table
+          block = Proc.new do |t|
+            t.string :name
+            t.rename :kind, :cultivar
+          end
+
+          @recorder.revert do
+            @recorder.change_table :fruits, bulk: true, &block
+          end
+
+          @recorder.revert do
+            @recorder.revert do
+              @recorder.change_table :fruits, bulk: true, &block
+            end
+          end
+
+          assert_equal [
+            [:change_table, [:fruits]],
+            [:change_table, [:fruits]]
+          ], @recorder.commands.map { |command| command[0...-1] }
+        end
+      end
+
       def test_invert_create_table
         @recorder.revert do
           @recorder.record :create_table, [:system_settings]
         end
         drop_table = @recorder.commands.first
         assert_equal [:drop_table, [:system_settings], nil], drop_table
+      end
+
+      def test_invert_create_table_with_if_not_exists
+        @recorder.revert do
+          @recorder.record :create_table, [:system_settings, if_not_exists: true]
+        end
+        drop_table = @recorder.commands.first
+        assert_equal [:drop_table, [:system_settings, {}], nil], drop_table
       end
 
       def test_invert_create_table_with_options_and_block
@@ -125,6 +162,12 @@ module ActiveRecord
       def test_invert_drop_table
         block = Proc.new { }
         create_table = @recorder.inverse_of :drop_table, [:people_reminders, id: false], &block
+        assert_equal [:create_table, [:people_reminders, id: false], block], create_table
+      end
+
+      def test_invert_drop_table_with_if_exists
+        block = Proc.new { }
+        create_table = @recorder.inverse_of :drop_table, [:people_reminders, id: false, if_exists: true], &block
         assert_equal [:create_table, [:people_reminders, id: false], block], create_table
       end
 
@@ -182,7 +225,7 @@ module ActiveRecord
         assert_equal [:change_column_default, [:table, :column, from: false, to: true]], change
       end
 
-      if ActiveRecord::Base.connection.supports_comments?
+      if ActiveRecord::Base.lease_connection.supports_comments?
         def test_invert_change_column_comment
           assert_raises(ActiveRecord::IrreversibleMigration) do
             @recorder.inverse_of :change_column_comment, [:table, :column, "comment"]
@@ -239,22 +282,27 @@ module ActiveRecord
 
       def test_invert_add_index
         remove = @recorder.inverse_of :add_index, [:table, [:one, :two]]
-        assert_equal [:remove_index, [:table, { column: [:one, :two] }]], remove
+        assert_equal [:remove_index, [:table, [:one, :two]], nil], remove
       end
 
       def test_invert_add_index_with_name
         remove = @recorder.inverse_of :add_index, [:table, [:one, :two], name: "new_index"]
-        assert_equal [:remove_index, [:table, { name: "new_index" }]], remove
+        assert_equal [:remove_index, [:table, [:one, :two], name: "new_index"], nil], remove
       end
 
       def test_invert_add_index_with_algorithm_option
         remove = @recorder.inverse_of :add_index, [:table, :one, algorithm: :concurrently]
-        assert_equal [:remove_index, [:table, { column: :one, algorithm: :concurrently }]], remove
+        assert_equal [:remove_index, [:table, :one, algorithm: :concurrently], nil], remove
       end
 
       def test_invert_remove_index
         add = @recorder.inverse_of :remove_index, [:table, :one]
         assert_equal [:add_index, [:table, :one]], add
+      end
+
+      def test_invert_remove_index_with_positional_column
+        add = @recorder.inverse_of :remove_index, [:table, [:one, :two], { options: true }]
+        assert_equal [:add_index, [:table, [:one, :two], options: true]], add
       end
 
       def test_invert_remove_index_with_column
@@ -269,7 +317,7 @@ module ActiveRecord
 
       def test_invert_remove_index_with_no_special_options
         add = @recorder.inverse_of :remove_index, [:table, { column: [:one, :two] }]
-        assert_equal [:add_index, [:table, [:one, :two], {}]], add
+        assert_equal [:add_index, [:table, [:one, :two]]], add
       end
 
       def test_invert_remove_index_with_no_column
@@ -330,7 +378,7 @@ module ActiveRecord
 
       def test_invert_add_foreign_key
         enable = @recorder.inverse_of :add_foreign_key, [:dogs, :people]
-        assert_equal [:remove_foreign_key, [:dogs, :people]], enable
+        assert_equal [:remove_foreign_key, [:dogs, :people], nil], enable
       end
 
       def test_invert_remove_foreign_key
@@ -340,7 +388,7 @@ module ActiveRecord
 
       def test_invert_add_foreign_key_with_column
         enable = @recorder.inverse_of :add_foreign_key, [:dogs, :people, column: "owner_id"]
-        assert_equal [:remove_foreign_key, [:dogs, column: "owner_id"]], enable
+        assert_equal [:remove_foreign_key, [:dogs, :people, column: "owner_id"], nil], enable
       end
 
       def test_invert_remove_foreign_key_with_column
@@ -350,7 +398,7 @@ module ActiveRecord
 
       def test_invert_add_foreign_key_with_column_and_name
         enable = @recorder.inverse_of :add_foreign_key, [:dogs, :people, column: "owner_id", name: "fk"]
-        assert_equal [:remove_foreign_key, [:dogs, name: "fk"]], enable
+        assert_equal [:remove_foreign_key, [:dogs, :people, column: "owner_id", name: "fk"], nil], enable
       end
 
       def test_invert_remove_foreign_key_with_column_and_name
@@ -402,6 +450,108 @@ module ActiveRecord
               @recorder.execute "some sql"
             end
           end
+        end
+      end
+
+      def test_invert_add_check_constraint
+        enable = @recorder.inverse_of :add_check_constraint, [:dogs, "speed > 0", name: "speed_check"]
+        assert_equal [:remove_check_constraint, [:dogs, "speed > 0", name: "speed_check"], nil], enable
+      end
+
+      def test_invert_add_check_constraint_if_not_exists
+        enable = @recorder.inverse_of :add_check_constraint, [:dogs, "speed > 0", name: "speed_check", if_not_exists: true]
+        assert_equal [:remove_check_constraint, [:dogs, "speed > 0", name: "speed_check", if_exists: true], nil], enable
+      end
+
+      def test_invert_remove_check_constraint
+        enable = @recorder.inverse_of :remove_check_constraint, [:dogs, "speed > 0", name: "speed_check"]
+        assert_equal [:add_check_constraint, [:dogs, "speed > 0", name: "speed_check"], nil], enable
+      end
+
+      def test_invert_remove_check_constraint_without_expression
+        assert_raises(ActiveRecord::IrreversibleMigration) do
+          @recorder.inverse_of :remove_check_constraint, [:dogs]
+        end
+      end
+
+      def test_invert_remove_check_constraint_if_exists
+        enable = @recorder.inverse_of :remove_check_constraint, [:dogs, "speed > 0", name: "speed_check", if_exists: true]
+        assert_equal [:add_check_constraint, [:dogs, "speed > 0", name: "speed_check", if_not_exists: true], nil], enable
+      end
+
+      def test_invert_add_unique_constraint_constraint_with_using_index
+        assert_raises(ActiveRecord::IrreversibleMigration) do
+          @recorder.inverse_of :add_unique_constraint, [:dogs, using_index: "unique_index"]
+        end
+      end
+
+      def test_invert_remove_unique_constraint_constraint
+        enable = @recorder.inverse_of :remove_unique_constraint, [:dogs, ["speed"], deferrable: :deferred, name: "uniq_speed"]
+        assert_equal [:add_unique_constraint, [:dogs, ["speed"], deferrable: :deferred, name: "uniq_speed"], nil], enable
+      end
+
+      def test_invert_remove_unique_constraint_constraint_without_options
+        enable = @recorder.inverse_of :remove_unique_constraint, [:dogs, ["speed"]]
+        assert_equal [:add_unique_constraint, [:dogs, ["speed"]], nil], enable
+      end
+
+      def test_invert_remove_unique_constraint_constraint_without_columns
+        assert_raises(ActiveRecord::IrreversibleMigration) do
+          @recorder.inverse_of :remove_unique_constraint, [:dogs, name: "uniq_speed"]
+        end
+      end
+
+      def test_invert_create_enum
+        drop = @recorder.inverse_of :create_enum, [:color, ["blue", "green"]]
+        assert_equal [:drop_enum, [:color, ["blue", "green"]], nil], drop
+      end
+
+      def test_invert_drop_enum
+        create = @recorder.inverse_of :drop_enum, [:color, ["blue", "green"]]
+        assert_equal [:create_enum, [:color, ["blue", "green"]], nil], create
+      end
+
+      def test_invert_drop_enum_without_values
+        assert_raises(ActiveRecord::IrreversibleMigration) do
+          @recorder.inverse_of :drop_enum, [:color]
+        end
+
+        assert_raises(ActiveRecord::IrreversibleMigration) do
+          @recorder.inverse_of :drop_enum, [:color, if_exists: true]
+        end
+      end
+
+      def test_invert_rename_enum
+        enum = @recorder.inverse_of :rename_enum, [:dog_breed, to: :breed]
+        assert_equal [:rename_enum, [:breed, to: :dog_breed]], enum
+      end
+
+      def test_invert_rename_enum_without_to
+        assert_raises(ActiveRecord::IrreversibleMigration) do
+          @recorder.inverse_of :rename_enum, [:breed]
+        end
+      end
+
+      def test_invert_add_enum_value
+        assert_raises(ActiveRecord::IrreversibleMigration) do
+          @recorder.inverse_of :add_enum_value, [:dog_breed, :beagle]
+        end
+      end
+
+      def test_invert_rename_enum_value
+        enum_value = @recorder.inverse_of :rename_enum_value, [:dog_breed, from: :retriever, to: :beagle]
+        assert_equal [:rename_enum_value, [:dog_breed, from: :beagle, to: :retriever]], enum_value
+      end
+
+      def test_invert_rename_enum_value_without_from
+        assert_raises(ActiveRecord::IrreversibleMigration) do
+          @recorder.inverse_of :rename_enum_value, [:dog_breed, to: :retriever]
+        end
+      end
+
+      def test_invert_rename_enum_value_without_to
+        assert_raises(ActiveRecord::IrreversibleMigration) do
+          @recorder.inverse_of :rename_enum_value, [:dog_breed, from: :beagle]
         end
       end
     end

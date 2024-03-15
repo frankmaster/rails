@@ -1,70 +1,108 @@
-*   Reduced log noise handling ActionController::RoutingErrors.
+*   Request Forgery takes relative paths into account.
 
-    *Alberto Fernández-Capel*
+    *Stefan Wienert*
 
-*   Add DSL for configuring HTTP Feature Policy
+*   Add ".test" as a default allowed host in development to ensure smooth golden-path setup with puma.dev.
 
-    This new DSL provides a way to configure a HTTP Feature Policy at a
-    global or per-controller level. Full details of HTTP Feature Policy
-    specification and guidelines can be found at MDN:
+    *DHH*
 
-    https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Feature-Policy
+*   Add `allow_browser` to set minimum browser versions for the application.
 
-    Example global policy
+    A browser that's blocked will by default be served the file in `public/426.html` with a HTTP status code of "426 Upgrade Required".
 
-    ```
-    Rails.application.config.feature_policy do |f|
-      f.camera      :none
-      f.gyroscope   :none
-      f.microphone  :none
-      f.usb         :none
-      f.fullscreen  :self
-      f.payment     :self, "https://secure.example.com"
+    ```ruby
+    class ApplicationController < ActionController::Base
+      # Allow only browsers natively supporting webp images, web push, badges, import maps, CSS nesting + :has
+      allow_browser versions: :modern
+    end
+
+    class ApplicationController < ActionController::Base
+      # All versions of Chrome and Opera will be allowed, but no versions of "internet explorer" (ie). Safari needs to be 16.4+ and Firefox 121+.
+      allow_browser versions: { safari: 16.4, firefox: 121, ie: false }
+    end
+
+    class MessagesController < ApplicationController
+      # In addition to the browsers blocked by ApplicationController, also block Opera below 104 and Chrome below 119 for the show action.
+      allow_browser versions: { opera: 104, chrome: 119 }, only: :show
     end
     ```
 
-    Example controller level policy
+    *DHH*
 
-    ```
-    class PagesController < ApplicationController
-      feature_policy do |p|
-        p.geolocation "https://example.com"
-      end
+*   Add rate limiting API.
+
+    ```ruby
+    class SessionsController < ApplicationController
+      rate_limit to: 10, within: 3.minutes, only: :create
+    end
+
+    class SignupsController < ApplicationController
+      rate_limit to: 1000, within: 10.seconds,
+        by: -> { request.domain }, with: -> { redirect_to busy_controller_url, alert: "Too many signups!" }, only: :new
     end
     ```
 
-    *Jacob Bednarz*
+    *DHH*, *Jean Boussier*
 
-*   Add the ability to set the CSP nonce only to the specified directives.
+*   Add `image/svg+xml` to the compressible content types of ActionDispatch::Static
 
-    Fixes #35137.
+    *Georg Ledermann*
 
-    *Yuji Yaginuma*
+*   Add instrumentation for ActionController::Live#send_stream
 
-*   Keep part when scope option has value.
+    Allows subscribing to `send_stream` events. The event payload contains the filename, disposition, and type.
 
-    When a route was defined within an optional scope, if that route didn't
-    take parameters the scope was lost when using path helpers. This commit
-    ensures scope is kept both when the route takes parameters or when it
-    doesn't.
+    *Hannah Ramadan*
 
-    Fixes #33219.
+*   Add support for `with_routing` test helper in `ActionDispatch::IntegrationTest`
 
-    *Alberto Almagro*
+    *Gannon McGibbon*
 
-*   Added `deep_transform_keys` and `deep_transform_keys!` methods to ActionController::Parameters.
+*   Remove deprecated support to set `Rails.application.config.action_dispatch.show_exceptions` to `true` and `false`.
 
-    *Gustavo Gutierrez*
+    *Rafael Mendonça França*
 
-*   Calling `ActionController::Parameters#transform_keys/!` without a block now returns
-    an enumerator for the parameters instead of the underlying hash.
+*   Remove deprecated `speaker`, `vibrate`, and `vr` permissions policy directives.
 
-    *Eugene Kenny*
+    *Rafael Mendonça França*
 
-*   Fix strong parameters blocks all attributes even when only some keys are invalid (non-numerical).
-    It should only block invalid key's values instead.
+*   Remove deprecated `Rails.application.config.action_dispatch.return_only_request_media_type_on_content_type`.
 
-    *Stan Lo*
+    *Rafael Mendonça França*
 
+*   Deprecate `Rails.application.config.action_controller.allow_deprecated_parameters_hash_equality`.
 
-Please check [6-0-stable](https://github.com/rails/rails/blob/6-0-stable/actionpack/CHANGELOG.md) for previous changes.
+    *Rafael Mendonça França*
+
+*   Remove deprecated comparison between `ActionController::Parameters` and `Hash`.
+
+    *Rafael Mendonça França*
+
+*   Remove deprecated constant `AbstractController::Helpers::MissingHelperError`.
+
+    *Rafael Mendonça França*
+
+*   Fix a race condition that could cause a `Text file busy - chromedriver`
+    error with parallel system tests
+
+    *Matt Brictson*
+
+*   Add `racc` as a dependency since it will become a bundled gem in Ruby 3.4.0
+
+    *Hartley McGuire*
+*   Remove deprecated constant `ActionDispatch::IllegalStateError`.
+
+    *Rafael Mendonça França*
+
+*   Add parameter filter capability for redirect locations.
+
+    It uses the `config.filter_parameters` to match what needs to be filtered.
+    The result would be like this:
+
+        Redirected to http://secret.foo.bar?username=roque&password=[FILTERED]
+
+    Fixes #14055.
+
+    *Roque Pinel*, *Trevor Turk*, *tonytonyjan*
+
+Please check [7-1-stable](https://github.com/rails/rails/blob/7-1-stable/actionpack/CHANGELOG.md) for previous changes.

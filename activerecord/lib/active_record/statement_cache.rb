@@ -4,14 +4,14 @@ module ActiveRecord
   # Statement cache is used to cache a single statement in order to avoid creating the AST again.
   # Initializing the cache is done by passing the statement in the create block:
   #
-  #   cache = StatementCache.create(Book.connection) do |params|
+  #   cache = StatementCache.create(ClothingItem.lease_connection) do |params|
   #     Book.where(name: "my book").where("author_id > 3")
   #   end
   #
   # The cached statement is executed by using the
   # {connection.execute}[rdoc-ref:ConnectionAdapters::DatabaseStatements#execute] method:
   #
-  #   cache.execute([], Book.connection)
+  #   cache.execute([], ClothingItem.lease_connection)
   #
   # The relation returned by the block is cached, and for each
   # {execute}[rdoc-ref:ConnectionAdapters::DatabaseStatements#execute]
@@ -20,13 +20,13 @@ module ActiveRecord
   # If you want to cache the statement without the values you can use the +bind+ method of the
   # block parameter.
   #
-  #   cache = StatementCache.create(Book.connection) do |params|
+  #   cache = StatementCache.create(ClothingItem.lease_connection) do |params|
   #     Book.where(name: params.bind)
   #   end
   #
   # And pass the bind values as the first argument of +execute+ call.
   #
-  #   cache.execute(["my book"], Book.connection)
+  #   cache.execute(["my book"], ClothingItem.lease_connection)
   class StatementCache # :nodoc:
     class Substitute; end # :nodoc:
 
@@ -50,13 +50,20 @@ module ActiveRecord
 
       def sql_for(binds, connection)
         val = @values.dup
-        casted_binds = binds.map(&:value_for_database)
-        @indexes.each { |i| val[i] = connection.quote(casted_binds.shift) }
+        @indexes.each do |i|
+          value = binds.shift
+          if ActiveModel::Attribute === value
+            value = value.value_for_database
+          end
+          val[i] = connection.quote(value)
+        end
         val.join
       end
     end
 
     class PartialQueryCollector
+      attr_accessor :preparable
+
       def initialize
         @parts = []
         @binds = []
@@ -70,6 +77,15 @@ module ActiveRecord
       def add_bind(obj)
         @binds << obj
         @parts << Substitute.new
+        self
+      end
+
+      def add_binds(binds, proc_for_binds = nil)
+        @binds.concat proc_for_binds ? binds.map(&proc_for_binds) : binds
+        binds.size.times do |i|
+          @parts << ", " unless i == 0
+          @parts << Substitute.new
+        end
         self
       end
 
@@ -100,7 +116,7 @@ module ActiveRecord
         @bound_attributes = bound_attributes
 
         bound_attributes.each_with_index do |attr, i|
-          if Substitute === attr.value
+          if ActiveModel::Attribute === attr && Substitute === attr.value
             @indexes << i
           end
         end
@@ -133,7 +149,7 @@ module ActiveRecord
 
       klass.find_by_sql(sql, bind_values, preparable: true, &block)
     rescue ::RangeError
-      nil
+      []
     end
 
     def self.unsupported_value?(value)

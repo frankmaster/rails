@@ -4,8 +4,8 @@ require "active_support/number_helper/number_converter"
 
 module ActiveSupport
   module NumberHelper
-    class NumberToHumanSizeConverter < NumberConverter #:nodoc:
-      STORAGE_UNITS = [:byte, :kb, :mb, :gb, :tb, :pb, :eb]
+    class NumberToHumanSizeConverter < NumberConverter # :nodoc:
+      STORAGE_UNITS = [:byte, :kb, :mb, :gb, :tb, :pb, :eb, :zb]
 
       self.namespace      = :human
       self.validate_float = true
@@ -13,7 +13,7 @@ module ActiveSupport
       def convert
         @number = Float(number)
 
-        # for backwards compatibility with those that didn't add strip_insignificant_zeros to their locale files
+        # For backwards compatibility with those that didn't add strip_insignificant_zeros to their locale files.
         unless options.key?(:strip_insignificant_zeros)
           options[:strip_insignificant_zeros] = true
         end
@@ -43,13 +43,13 @@ module ActiveSupport
 
         def exponent
           max = STORAGE_UNITS.size - 1
-          exp = (Math.log(number) / Math.log(base)).to_i
+          exp = (Math.log(number.abs) / Math.log(base)).to_i
           exp = max if exp > max # avoid overflow for the highest unit
           exp
         end
 
         def smaller_than_base?
-          number.to_i < base
+          number.to_i.abs < base
         end
 
         def base

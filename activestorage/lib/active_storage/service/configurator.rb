@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 module ActiveStorage
-  class Service::Configurator #:nodoc:
+  class Service::Configurator # :nodoc:
     attr_reader :configurations
 
     def self.build(service_name, configurations)
@@ -14,7 +14,9 @@ module ActiveStorage
 
     def build(service_name)
       config = config_for(service_name.to_sym)
-      resolve(config.fetch(:service)).build(**config, configurator: self)
+      resolve(config.fetch(:service)).build(
+        **config, configurator: self, name: service_name
+      )
     end
 
     private

@@ -6,7 +6,7 @@ import Subscriptions from "./subscriptions"
 // The Consumer instance is also the gateway to establishing subscriptions to desired channels through the #createSubscription
 // method.
 //
-// The following example shows how this can be setup:
+// The following example shows how this can be set up:
 //
 //   App = {}
 //   App.cable = ActionCable.createConsumer("ws://example.com/accounts/1")
@@ -32,6 +32,7 @@ export default class Consumer {
     this._url = url
     this.subscriptions = new Subscriptions(this)
     this.connection = new Connection(this)
+    this.subprotocols = []
   }
 
   get url() {
@@ -54,6 +55,10 @@ export default class Consumer {
     if (!this.connection.isActive()) {
       return this.connection.open()
     }
+  }
+
+  addSubProtocol(subprotocol) {
+    this.subprotocols = [...this.subprotocols, subprotocol]
   }
 }
 

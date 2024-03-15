@@ -10,11 +10,11 @@ describe Arel::Nodes::UpdateStatement do
       statement.values = %w[x y z]
 
       dolly = statement.clone
-      dolly.wheres.must_equal statement.wheres
-      dolly.wheres.wont_be_same_as statement.wheres
+      _(dolly.wheres).must_equal statement.wheres
+      _(dolly.wheres).wont_be_same_as statement.wheres
 
-      dolly.values.must_equal statement.values
-      dolly.values.wont_be_same_as statement.values
+      _(dolly.values).must_equal statement.values
+      _(dolly.values).wont_be_same_as statement.values
     end
   end
 
@@ -27,6 +27,8 @@ describe Arel::Nodes::UpdateStatement do
       statement1.orders   = %w[x y z]
       statement1.limit    = 42
       statement1.key      = "zomg"
+      statement1.groups   = ["foo"]
+      statement1.havings  = []
       statement2 = Arel::Nodes::UpdateStatement.new
       statement2.relation = "zomg"
       statement2.wheres   = 2
@@ -34,6 +36,8 @@ describe Arel::Nodes::UpdateStatement do
       statement2.orders   = %w[x y z]
       statement2.limit    = 42
       statement2.key      = "zomg"
+      statement2.groups   = ["foo"]
+      statement2.havings  = []
       array = [statement1, statement2]
       assert_equal 1, array.uniq.size
     end

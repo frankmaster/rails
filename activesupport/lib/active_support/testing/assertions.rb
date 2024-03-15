@@ -1,13 +1,15 @@
 # frozen_string_literal: true
 
+require "active_support/core_ext/enumerable"
+
 module ActiveSupport
   module Testing
     module Assertions
       UNTRACKED = Object.new # :nodoc:
 
-      # Asserts that an expression is not truthy. Passes if <tt>object</tt> is
-      # +nil+ or +false+. "Truthy" means "considered true in a conditional"
-      # like <tt>if foo</tt>.
+      # Asserts that an expression is not truthy. Passes if +object+ is +nil+ or
+      # +false+. "Truthy" means "considered true in a conditional" like <tt>if
+      # foo</tt>.
       #
       #   assert_not nil    # => true
       #   assert_not false  # => true
@@ -21,6 +23,21 @@ module ActiveSupport
         assert !object, message
       end
 
+      # Asserts that a block raises one of +exp+. This is an enhancement of the
+      # standard Minitest assertion method with the ability to test error
+      # messages.
+      #
+      #   assert_raises(ArgumentError, match: /incorrect param/i) do
+      #     perform_service(param: 'exception')
+      #   end
+      #
+      def assert_raises(*exp, match: nil, &block)
+        error = super(*exp, &block)
+        assert_match(match, error.message) if match
+        error
+      end
+      alias :assert_raise :assert_raises
+
       # Assertion that the block should not raise an exception.
       #
       # Passes if evaluated code in the yielded block raises no exception.
@@ -29,7 +46,9 @@ module ActiveSupport
       #     perform_service(param: 'no_exception')
       #   end
       def assert_nothing_raised
-        yield
+        yield.tap { assert(true) }
+      rescue => error
+        raise Minitest::UnexpectedError.new(error)
       end
 
       # Test numeric difference between the return value of an expression as a
@@ -46,7 +65,7 @@ module ActiveSupport
       #   end
       #
       # An arbitrary positive or negative difference can be specified.
-      # The default is <tt>1</tt>.
+      # The default is +1+.
       #
       #   assert_difference 'Article.count', -1 do
       #     post :delete, params: { id: ... }
@@ -87,7 +106,7 @@ module ActiveSupport
           else
             difference = args[0] || 1
             message = args[1]
-            Hash[Array(expression).map { |e| [e, difference] }]
+            Array(expression).index_with(difference)
           end
 
         exps = expressions.keys.map { |e|
@@ -95,12 +114,13 @@ module ActiveSupport
         }
         before = exps.map(&:call)
 
-        retval = yield
+        retval = _assert_nothing_raised_or_warn("assert_difference", &block)
 
         expressions.zip(exps, before) do |(code, diff), exp, before_value|
-          error  = "#{code.inspect} didn't change by #{diff}"
+          actual = exp.call
+          error  = "#{code.inspect} didn't change by #{diff}, but by #{actual - before_value}"
           error  = "#{message}.\n#{error}" if message
-          assert_equal(before_value + diff, exp.call, error)
+          assert_equal(before_value + diff, actual, error)
         end
 
         retval
@@ -155,7 +175,7 @@ module ActiveSupport
       #     @object = 42
       #   end
       #
-      # The keyword arguments :from and :to can be given to specify the
+      # The keyword arguments +:from+ and +:to+ can be given to specify the
       # expected initial value and the expected value after the block was
       # executed.
       #
@@ -172,10 +192,10 @@ module ActiveSupport
         exp = expression.respond_to?(:call) ? expression : -> { eval(expression.to_s, block.binding) }
 
         before = exp.call
-        retval = yield
+        retval = _assert_nothing_raised_or_warn("assert_changes", &block)
 
         unless from == UNTRACKED
-          error = "#{expression.inspect} isn't #{from.inspect}"
+          error = "Expected change from #{from.inspect}, got #{before.inspect}"
           error = "#{message}.\n#{error}" if message
           assert from === before, error
         end
@@ -183,14 +203,12 @@ module ActiveSupport
         after = exp.call
 
         error = "#{expression.inspect} didn't change"
-        error = "#{error}. It was already #{to}" if before == to
+        error = "#{error}. It was already #{to.inspect}" if before == to
         error = "#{message}.\n#{error}" if message
-        assert before != after, error
+        refute_equal before, after, error
 
         unless to == UNTRACKED
-          error = "#{expression.inspect} didn't change to as expected\n"
-          error = "#{error}Expected: #{to.inspect}\n"
-          error = "#{error}  Actual: #{after.inspect}"
+          error = "Expected change to #{to.inspect}, got #{after.inspect}\n"
           error = "#{message}.\n#{error}" if message
           assert to === after, error
         end
@@ -205,24 +223,59 @@ module ActiveSupport
       #     post :create, params: { status: { ok: true } }
       #   end
       #
+      # Provide the optional keyword argument +:from+ to specify the expected
+      # initial value.
+      #
+      #   assert_no_changes -> { Status.all_good? }, from: true do
+      #     post :create, params: { status: { ok: true } }
+      #   end
+      #
       # An error message can be specified.
       #
       #   assert_no_changes -> { Status.all_good? }, 'Expected the status to be good' do
       #     post :create, params: { status: { ok: false } }
       #   end
-      def assert_no_changes(expression, message = nil, &block)
+      def assert_no_changes(expression, message = nil, from: UNTRACKED, &block)
         exp = expression.respond_to?(:call) ? expression : -> { eval(expression.to_s, block.binding) }
 
         before = exp.call
-        retval = yield
+        retval = _assert_nothing_raised_or_warn("assert_no_changes", &block)
+
+        unless from == UNTRACKED
+          error = "Expected initial value of #{from.inspect}, got #{before.inspect}"
+          error = "#{message}.\n#{error}" if message
+          assert from === before, error
+        end
+
         after = exp.call
 
-        error = "#{expression.inspect} did change to #{after}"
+        error = "#{expression.inspect} changed"
         error = "#{message}.\n#{error}" if message
-        assert before == after, error
+
+        if before.nil?
+          assert_nil after, error
+        else
+          assert_equal before, after, error
+        end
 
         retval
       end
+
+      private
+        def _assert_nothing_raised_or_warn(assertion, &block)
+          assert_nothing_raised(&block)
+        rescue Minitest::UnexpectedError => e
+          if tagged_logger && tagged_logger.warn?
+            warning = <<~MSG
+              #{self.class} - #{name}: #{e.error.class} raised.
+              If you expected this exception, use `assert_raises` as near to the code that raises as possible.
+              Other block based assertions (e.g. `#{assertion}`) can be used, as long as `assert_raises` is inside their block.
+            MSG
+            tagged_logger.warn warning
+          end
+
+          raise
+        end
     end
   end
 end

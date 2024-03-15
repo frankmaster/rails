@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-require "abstract_unit"
+require_relative "abstract_unit"
 require "active_support/actionable_error"
 
 class ActionableErrorTest < ActiveSupport::TestCase
@@ -27,8 +27,8 @@ class ActionableErrorTest < ActiveSupport::TestCase
   end
 
   test "returns no actions for non-actionable errors" do
-    assert ActiveSupport::ActionableError.actions(Exception).empty?
-    assert ActiveSupport::ActionableError.actions(Exception.new).empty?
+    assert_predicate ActiveSupport::ActionableError.actions(Exception), :empty?
+    assert_predicate ActiveSupport::ActionableError.actions(Exception.new), :empty?
   end
 
   test "dispatches actions from error and name" do

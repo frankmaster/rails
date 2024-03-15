@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "tempfile"
+
 require "isolation/abstract_unit"
 require "console_helpers"
 
@@ -107,7 +109,7 @@ class FullStackConsoleTest < ActiveSupport::TestCase
       class Post < ActiveRecord::Base
       end
     CODE
-    system "#{app_path}/bin/rails runner 'Post.connection.create_table :posts'"
+    system "#{app_path}/bin/rails runner 'Post.lease_connection.create_table :posts'"
 
     @primary, @replica = PTY.open
   end
@@ -119,12 +121,13 @@ class FullStackConsoleTest < ActiveSupport::TestCase
   def write_prompt(command, expected_output = nil)
     @primary.puts command
     assert_output command, @primary
-    assert_output expected_output, @primary if expected_output
+    assert_output expected_output, @primary, 100 if expected_output
     assert_output "> ", @primary
   end
 
-  def spawn_console(options, wait_for_prompt: true)
+  def spawn_console(options, wait_for_prompt: true, env: {})
     pid = Process.spawn(
+      { "TERM" => "dumb" }.merge(env),
       "#{app_path}/bin/rails console #{options}",
       in: @replica, out: @replica, err: @replica
     )
@@ -137,14 +140,15 @@ class FullStackConsoleTest < ActiveSupport::TestCase
   end
 
   def test_sandbox
-    spawn_console("--sandbox")
+    options = "--sandbox"
+    spawn_console(options)
 
     write_prompt "Post.count", "=> 0"
     write_prompt "Post.create"
     write_prompt "Post.count", "=> 1"
     @primary.puts "quit"
 
-    spawn_console("--sandbox")
+    spawn_console(options)
 
     write_prompt "Post.count", "=> 0"
     write_prompt "Post.transaction { Post.create; raise }"
@@ -163,11 +167,105 @@ class FullStackConsoleTest < ActiveSupport::TestCase
     assert_equal 1, $?.exitstatus
   end
 
+  def test_sandbox_by_default
+    add_to_config <<-RUBY
+      config.sandbox_by_default = true
+    RUBY
+
+    options = "-e production -- --verbose"
+    spawn_console(options)
+
+    write_prompt "puts Rails.application.sandbox", "puts Rails.application.sandbox\r\ntrue"
+    @primary.puts "quit"
+  end
+
+  def test_sandbox_by_default_with_no_sandbox
+    add_to_config <<-RUBY
+      config.sandbox_by_default = true
+    RUBY
+
+    options = "-e production --no-sandbox -- --verbose"
+    spawn_console(options)
+
+    write_prompt "puts Rails.application.sandbox", "puts Rails.application.sandbox\r\nfalse"
+    @primary.puts "quit"
+  end
+
+  def test_sandbox_by_default_with_development_environment
+    add_to_config <<-RUBY
+      config.sandbox_by_default = true
+    RUBY
+
+    options = "-- --verbose"
+    spawn_console(options)
+
+    write_prompt "puts Rails.application.sandbox", "puts Rails.application.sandbox\r\nfalse"
+    @primary.puts "quit"
+  end
+
   def test_environment_option_and_irb_option
-    spawn_console("-e test -- --verbose")
+    options = "-e test -- --verbose"
+    spawn_console(options)
 
     write_prompt "a = 1", "a = 1"
     write_prompt "puts Rails.env", "puts Rails.env\r\ntest"
     @primary.puts "quit"
+  end
+
+  def test_production_console_prompt
+    options = "-e production"
+    spawn_console(options)
+
+    write_prompt "123", "app-template(prod)> 123"
+  end
+
+  def test_development_console_prompt
+    options = "-e development"
+    spawn_console(options)
+
+    write_prompt "123", "app-template(dev)> 123"
+  end
+
+  def test_test_console_prompt
+    options = "-e test"
+    spawn_console(options)
+
+    write_prompt "123", "app-template(test)> 123"
+  end
+
+  def test_console_respects_user_defined_prompt_mode
+    irbrc = Tempfile.new("irbrc")
+    irbrc.write <<-RUBY
+      IRB.conf[:PROMPT_MODE] = :SIMPLE
+    RUBY
+    irbrc.close
+
+    options = "-e test"
+    spawn_console(options, env: { "IRBRC" => irbrc.path })
+
+    write_prompt "123", ">> 123"
+  ensure
+    File.unlink(irbrc)
+  end
+
+  def test_console_disables_IRB_auto_completion_in_non_local
+    options = "-e production -- --verbose"
+    spawn_console(options)
+
+    write_prompt "IRB.conf[:USE_AUTOCOMPLETE]", "IRB.conf[:USE_AUTOCOMPLETE]\r\n=> false"
+  end
+
+  def test_console_accepts_override_on_IRB_auto_completion_flag
+    options = "-e production -- --verbose"
+    spawn_console(options, env: { "IRB_USE_AUTOCOMPLETE" => "true" })
+
+    write_prompt "IRB.conf[:USE_AUTOCOMPLETE]", "IRB.conf[:USE_AUTOCOMPLETE]\r\n=> true"
+  end
+
+  def test_console_doesnt_disable_IRB_auto_completion_in_local
+    options = "-e development -- --verbose"
+    spawn_console(options)
+
+    write_prompt "IRB.conf[:USE_AUTOCOMPLETE]", "IRB.conf[:USE_AUTOCOMPLETE]\r\n=> true"
   end
 end

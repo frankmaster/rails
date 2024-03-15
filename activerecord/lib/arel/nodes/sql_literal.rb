@@ -11,6 +11,15 @@ module Arel # :nodoc: all
       def encode_with(coder)
         coder.scalar = self.to_s
       end
+
+      def fetch_attribute
+      end
+
+      def +(other)
+        raise ArgumentError, "Expected Arel node" unless Arel.arel_node?(other)
+
+        Fragments.new([self, other])
+      end
     end
   end
 end

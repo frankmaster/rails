@@ -3,43 +3,56 @@
 require "thread"
 require "concurrent/map"
 require "monitor"
-require "weakref"
+
+require "active_record/connection_adapters/abstract/connection_pool/queue"
+require "active_record/connection_adapters/abstract/connection_pool/reaper"
 
 module ActiveRecord
-  # Raised when a connection could not be obtained within the connection
-  # acquisition timeout period: because max connections in pool
-  # are in use.
-  class ConnectionTimeoutError < ConnectionNotEstablished
-  end
-
-  # Raised when a pool was unable to get ahold of all its connections
-  # to perform a "group" action such as
-  # {ActiveRecord::Base.connection_pool.disconnect!}[rdoc-ref:ConnectionAdapters::ConnectionPool#disconnect!]
-  # or {ActiveRecord::Base.clear_reloadable_connections!}[rdoc-ref:ConnectionAdapters::ConnectionHandler#clear_reloadable_connections!].
-  class ExclusiveConnectionTimeoutError < ConnectionTimeoutError
-  end
-
   module ConnectionAdapters
     module AbstractPool # :nodoc:
-      def get_schema_cache(connection)
-        @schema_cache ||= SchemaCache.new(connection)
-        @schema_cache.connection = connection
-        @schema_cache
-      end
-
-      def set_schema_cache(cache)
-        @schema_cache = cache
-      end
     end
 
     class NullPool # :nodoc:
       include ConnectionAdapters::AbstractPool
 
+      class NullConfig # :nodoc:
+        def method_missing(...)
+          nil
+        end
+      end
+      NULL_CONFIG = NullConfig.new # :nodoc:
+
       def initialize
-        @schema_cache = nil
+        super()
+        @mutex = Mutex.new
+        @server_version = nil
+      end
+
+      def server_version(connection) # :nodoc:
+        @server_version || @mutex.synchronize { @server_version ||= connection.get_database_version }
+      end
+
+      def schema_reflection
+        SchemaReflection.new(nil)
+      end
+
+      def schema_cache; end
+      def connection_class; end
+      def checkin(_); end
+      def remove(_); end
+      def async_executor; end
+
+      def db_config
+        NULL_CONFIG
+      end
+
+      def dirties_query_cache
+        true
       end
     end
 
+    # = Active Record Connection Pool
+    #
     # Connection pool base class for managing Active Record database
     # connections.
     #
@@ -54,19 +67,17 @@ module ActiveRecord
     # handle cases in which there are more threads than connections: if all
     # connections have been checked out, and a thread tries to checkout a
     # connection anyway, then ConnectionPool will wait until some other thread
-    # has checked in a connection.
+    # has checked in a connection, or the +checkout_timeout+ has expired.
     #
     # == Obtaining (checking out) a connection
     #
     # Connections can be obtained and used from a connection pool in several
     # ways:
     #
-    # 1. Simply use {ActiveRecord::Base.connection}[rdoc-ref:ConnectionHandling.connection]
-    #    as with Active Record 2.1 and
-    #    earlier (pre-connection-pooling). Eventually, when you're done with
-    #    the connection(s) and wish it to be returned to the pool, you call
-    #    {ActiveRecord::Base.clear_active_connections!}[rdoc-ref:ConnectionAdapters::ConnectionHandler#clear_active_connections!].
-    #    This will be the default behavior for Active Record when used in conjunction with
+    # 1. Simply use {ActiveRecord::Base.lease_connection}[rdoc-ref:ConnectionHandling.connection].
+    #    When you're done with the connection(s) and wish it to be returned to the pool, you call
+    #    {ActiveRecord::Base.connection_handler.clear_active_connections!}[rdoc-ref:ConnectionAdapters::ConnectionHandler#clear_active_connections!].
+    #    This is the default behavior for Active Record when used in conjunction with
     #    Action Pack's request handling cycle.
     # 2. Manually check out a connection from the pool with
     #    {ActiveRecord::Base.connection_pool.checkout}[rdoc-ref:#checkout]. You are responsible for
@@ -78,6 +89,12 @@ module ActiveRecord
     #
     # Connections in the pool are actually AbstractAdapter objects (or objects
     # compatible with AbstractAdapter's interface).
+    #
+    # While a thread has a connection checked out from the pool using one of the
+    # above three methods, that connection will automatically be the one used
+    # by ActiveRecord queries executing on that thread. It is not required to
+    # explicitly pass the checked out connection to \Rails models or queries, for
+    # example.
     #
     # == Options
     #
@@ -101,295 +118,128 @@ module ActiveRecord
     # * private methods that require being called in a +synchronize+ blocks
     #   are now explicitly documented
     class ConnectionPool
-      # Threadsafe, fair, LIFO queue.  Meant to be used by ConnectionPool
-      # with which it shares a Monitor.
-      class Queue
-        def initialize(lock = Monitor.new)
-          @lock = lock
-          @cond = @lock.new_cond
-          @num_waiting = 0
-          @queue = []
+      class Lease # :nodoc:
+        attr_accessor :connection, :sticky
+
+        def initialize
+          @connection = nil
+          @sticky = false
         end
 
-        # Test if any threads are currently waiting on the queue.
-        def any_waiting?
-          synchronize do
-            @num_waiting > 0
+        def release
+          conn = @connection
+          @connection = nil
+          @sticky = false
+          conn
+        end
+
+        def clear(connection)
+          if @connection == connection
+            @connection = nil
+            @sticky = false
+            true
+          else
+            false
+          end
+        end
+      end
+
+      class LeaseRegistry # :nodoc:
+        if ObjectSpace.const_defined?(:WeakKeyMap) # RUBY_VERSION >= 3.3
+          WeakKeyMap = ::ObjectSpace::WeakKeyMap # :nodoc:
+        else
+          class WeakKeyMap # :nodoc:
+            def initialize
+              @map = ObjectSpace::WeakMap.new
+              @values = nil
+              @size = 0
+            end
+
+            alias_method :clear, :initialize
+
+            def [](key)
+              prune if @map.size != @size
+              @map[key]
+            end
+
+            def []=(key, value)
+              @map[key] = value
+              prune if @map.size != @size
+              value
+            end
+
+            def delete(key)
+              if value = self[key]
+                self[key] = nil
+                prune
+              end
+              value
+            end
+
+            private
+              def prune(force = false)
+                @values = @map.values
+                @size = @map.size
+              end
           end
         end
 
-        # Returns the number of threads currently waiting on this
-        # queue.
-        def num_waiting
-          synchronize do
-            @num_waiting
+        def initialize
+          @mutex = Mutex.new
+          @map = WeakKeyMap.new
+        end
+
+        def [](context)
+          @mutex.synchronize do
+            @map[context] ||= Lease.new
           end
         end
 
-        # Add +element+ to the queue.  Never blocks.
-        def add(element)
-          synchronize do
-            @queue.push element
-            @cond.signal
-          end
-        end
-
-        # If +element+ is in the queue, remove and return it, or +nil+.
-        def delete(element)
-          synchronize do
-            @queue.delete(element)
-          end
-        end
-
-        # Remove all elements from the queue.
         def clear
-          synchronize do
-            @queue.clear
+          @mutex.synchronize do
+            @map = WeakKeyMap.new
           end
-        end
-
-        # Remove the head of the queue.
-        #
-        # If +timeout+ is not given, remove and return the head the
-        # queue if the number of available elements is strictly
-        # greater than the number of threads currently waiting (that
-        # is, don't jump ahead in line).  Otherwise, return +nil+.
-        #
-        # If +timeout+ is given, block if there is no element
-        # available, waiting up to +timeout+ seconds for an element to
-        # become available.
-        #
-        # Raises:
-        # - ActiveRecord::ConnectionTimeoutError if +timeout+ is given and no element
-        # becomes available within +timeout+ seconds,
-        def poll(timeout = nil)
-          synchronize { internal_poll(timeout) }
-        end
-
-        private
-          def internal_poll(timeout)
-            no_wait_poll || (timeout && wait_poll(timeout))
-          end
-
-          def synchronize(&block)
-            @lock.synchronize(&block)
-          end
-
-          # Test if the queue currently contains any elements.
-          def any?
-            !@queue.empty?
-          end
-
-          # A thread can remove an element from the queue without
-          # waiting if and only if the number of currently available
-          # connections is strictly greater than the number of waiting
-          # threads.
-          def can_remove_no_wait?
-            @queue.size > @num_waiting
-          end
-
-          # Removes and returns the head of the queue if possible, or +nil+.
-          def remove
-            @queue.pop
-          end
-
-          # Remove and return the head the queue if the number of
-          # available elements is strictly greater than the number of
-          # threads currently waiting.  Otherwise, return +nil+.
-          def no_wait_poll
-            remove if can_remove_no_wait?
-          end
-
-          # Waits on the queue up to +timeout+ seconds, then removes and
-          # returns the head of the queue.
-          def wait_poll(timeout)
-            @num_waiting += 1
-
-            t0 = Concurrent.monotonic_time
-            elapsed = 0
-            loop do
-              ActiveSupport::Dependencies.interlock.permit_concurrent_loads do
-                @cond.wait(timeout - elapsed)
-              end
-
-              return remove if any?
-
-              elapsed = Concurrent.monotonic_time - t0
-              if elapsed >= timeout
-                msg = "could not obtain a connection from the pool within %0.3f seconds (waited %0.3f seconds); all pooled connections were in use" %
-                  [timeout, elapsed]
-                raise ConnectionTimeoutError, msg
-              end
-            end
-          ensure
-            @num_waiting -= 1
-          end
-      end
-
-      # Adds the ability to turn a basic fair FIFO queue into one
-      # biased to some thread.
-      module BiasableQueue # :nodoc:
-        class BiasedConditionVariable # :nodoc:
-          # semantics of condition variables guarantee that +broadcast+, +broadcast_on_biased+,
-          # +signal+ and +wait+ methods are only called while holding a lock
-          def initialize(lock, other_cond, preferred_thread)
-            @real_cond = lock.new_cond
-            @other_cond = other_cond
-            @preferred_thread = preferred_thread
-            @num_waiting_on_real_cond = 0
-          end
-
-          def broadcast
-            broadcast_on_biased
-            @other_cond.broadcast
-          end
-
-          def broadcast_on_biased
-            @num_waiting_on_real_cond = 0
-            @real_cond.broadcast
-          end
-
-          def signal
-            if @num_waiting_on_real_cond > 0
-              @num_waiting_on_real_cond -= 1
-              @real_cond
-            else
-              @other_cond
-            end.signal
-          end
-
-          def wait(timeout)
-            if Thread.current == @preferred_thread
-              @num_waiting_on_real_cond += 1
-              @real_cond
-            else
-              @other_cond
-            end.wait(timeout)
-          end
-        end
-
-        def with_a_bias_for(thread)
-          previous_cond = nil
-          new_cond      = nil
-          synchronize do
-            previous_cond = @cond
-            @cond = new_cond = BiasedConditionVariable.new(@lock, @cond, thread)
-          end
-          yield
-        ensure
-          synchronize do
-            @cond = previous_cond if previous_cond
-            new_cond.broadcast_on_biased if new_cond # wake up any remaining sleepers
-          end
-        end
-      end
-
-      # Connections must be leased while holding the main pool mutex. This is
-      # an internal subclass that also +.leases+ returned connections while
-      # still in queue's critical section (queue synchronizes with the same
-      # <tt>@lock</tt> as the main pool) so that a returned connection is already
-      # leased and there is no need to re-enter synchronized block.
-      class ConnectionLeasingQueue < Queue # :nodoc:
-        include BiasableQueue
-
-        private
-          def internal_poll(timeout)
-            conn = super
-            conn.lease if conn
-            conn
-          end
-      end
-
-      # Every +frequency+ seconds, the reaper will call +reap+ and +flush+ on
-      # +pool+. A reaper instantiated with a zero frequency will never reap
-      # the connection pool.
-      #
-      # Configure the frequency by setting +reaping_frequency+ in your database
-      # yaml file (default 60 seconds).
-      class Reaper
-        attr_reader :pool, :frequency
-
-        def initialize(pool, frequency)
-          @pool      = pool
-          @frequency = frequency
-        end
-
-        @mutex = Mutex.new
-        @pools = {}
-
-        class << self
-          def register_pool(pool, frequency) # :nodoc:
-            @mutex.synchronize do
-              unless @pools.key?(frequency)
-                @pools[frequency] = []
-                spawn_thread(frequency)
-              end
-              @pools[frequency] << WeakRef.new(pool)
-            end
-          end
-
-          private
-            def spawn_thread(frequency)
-              Thread.new(frequency) do |t|
-                loop do
-                  sleep t
-                  @mutex.synchronize do
-                    @pools[frequency].select!(&:weakref_alive?)
-                    @pools[frequency].each do |p|
-                      p.reap
-                      p.flush
-                    rescue WeakRef::RefError
-                    end
-                  end
-                end
-              end
-            end
-        end
-
-        def run
-          return unless frequency && frequency > 0
-          self.class.register_pool(pool, frequency)
         end
       end
 
       include MonitorMixin
-      include QueryCache::ConnectionPoolConfiguration
+      prepend QueryCache::ConnectionPoolConfiguration
       include ConnectionAdapters::AbstractPool
 
-      attr_accessor :automatic_reconnect, :checkout_timeout, :schema_cache
-      attr_reader :spec, :size, :reaper
+      attr_accessor :automatic_reconnect, :checkout_timeout
+      attr_reader :db_config, :size, :reaper, :pool_config, :async_executor, :role, :shard
 
-      # Creates a new ConnectionPool object. +spec+ is a ConnectionSpecification
+      delegate :schema_reflection, :server_version, to: :pool_config
+
+      # Creates a new ConnectionPool object. +pool_config+ is a PoolConfig
       # object which describes database connection information (e.g. adapter,
       # host name, username, password, etc), as well as the maximum size for
       # this ConnectionPool.
       #
       # The default ConnectionPool maximum size is 5.
-      def initialize(spec)
+      def initialize(pool_config)
         super()
 
-        @spec = spec
+        @pool_config = pool_config
+        @db_config = pool_config.db_config
+        @role = pool_config.role
+        @shard = pool_config.shard
 
-        @checkout_timeout = (spec.config[:checkout_timeout] && spec.config[:checkout_timeout].to_f) || 5
-        if @idle_timeout = spec.config.fetch(:idle_timeout, 300)
-          @idle_timeout = @idle_timeout.to_f
-          @idle_timeout = nil if @idle_timeout <= 0
-        end
-
-        # default max pool size to 5
-        @size = (spec.config[:pool] && spec.config[:pool].to_i) || 5
+        @checkout_timeout = db_config.checkout_timeout
+        @idle_timeout = db_config.idle_timeout
+        @size = db_config.pool
 
         # This variable tracks the cache of threads mapped to reserved connections, with the
         # sole purpose of speeding up the +connection+ method. It is not the authoritative
         # registry of which thread owns which connection. Connection ownership is tracked by
         # the +connection.owner+ attr on each +connection+ instance.
         # The invariant works like this: if there is mapping of <tt>thread => conn</tt>,
-        # then that +thread+ does indeed own that +conn+. However, an absence of a such
+        # then that +thread+ does indeed own that +conn+. However, an absence of such
         # mapping does not mean that the +thread+ doesn't own the said connection. In
         # that case +conn.owner+ attr should be consulted.
-        # Access and modification of <tt>@thread_cached_conns</tt> does not require
+        # Access and modification of <tt>@leases</tt> does not require
         # synchronization.
-        @thread_cached_conns = Concurrent::Map.new(initial_capacity: @size)
+        @leases = LeaseRegistry.new
 
         @connections         = []
         @automatic_reconnect = true
@@ -402,22 +252,39 @@ module ActiveRecord
         @threads_blocking_new_connections = 0
 
         @available = ConnectionLeasingQueue.new self
+        @pinned_connection = nil
 
-        @lock_thread = false
+        @async_executor = build_async_executor
 
-        # +reaping_frequency+ is configurable mostly for historical reasons, but it could
-        # also be useful if someone wants a very low +idle_timeout+.
-        reaping_frequency = spec.config.fetch(:reaping_frequency, 60)
-        @reaper = Reaper.new(self, reaping_frequency && reaping_frequency.to_f)
+        @schema_cache = nil
+
+        @reaper = Reaper.new(self, db_config.reaping_frequency)
         @reaper.run
       end
 
-      def lock_thread=(lock_thread)
-        if lock_thread
-          @lock_thread = Thread.current
-        else
-          @lock_thread = nil
-        end
+      def schema_cache
+        @schema_cache ||= BoundSchemaReflection.new(schema_reflection, self)
+      end
+
+      def schema_reflection=(schema_reflection)
+        pool_config.schema_reflection = schema_reflection
+        @schema_cache = nil
+      end
+
+      def migration_context # :nodoc:
+        MigrationContext.new(migrations_paths, schema_migration, internal_metadata)
+      end
+
+      def migrations_paths # :nodoc:
+        db_config.migrations_paths || Migrator.migrations_paths
+      end
+
+      def schema_migration # :nodoc:
+        SchemaMigration.new(self)
+      end
+
+      def internal_metadata # :nodoc:
+        InternalMetadata.new(self)
       end
 
       # Retrieve the connection associated with the current thread, or call
@@ -425,8 +292,57 @@ module ActiveRecord
       #
       # #connection can be called any number of times; the connection is
       # held in a cache keyed by a thread.
+      def lease_connection
+        lease = connection_lease
+        lease.sticky = true
+        lease.connection ||= checkout
+      end
+
       def connection
-        @thread_cached_conns[connection_cache_key(current_thread)] ||= checkout
+        ActiveRecord.deprecator.warn(<<~MSG)
+          ActiveRecord::ConnectionAdapters::ConnectionPool#connection is deprecated
+          and will be removed in Rails 7.3. Use #lease_connection instead.
+        MSG
+        lease_connection
+      end
+
+      def pin_connection!(lock_thread) # :nodoc:
+        raise "There is already a pinned connection" if @pinned_connection
+
+        @pinned_connection = (connection_lease&.connection || checkout)
+        # Any leased connection must be in @connections otherwise
+        # some methods like #connected? won't behave correctly
+        unless @connections.include?(@pinned_connection)
+          @connections << @pinned_connection
+        end
+
+        @pinned_connection.lock_thread = ActiveSupport::IsolatedExecutionState.context if lock_thread
+        @pinned_connection.verify! # eagerly validate the connection
+        @pinned_connection.begin_transaction joinable: false, _lazy: false
+      end
+
+      def unpin_connection! # :nodoc:
+        raise "There isn't a pinned connection #{object_id}" unless @pinned_connection
+
+        clean = true
+        @pinned_connection.lock.synchronize do
+          connection, @pinned_connection = @pinned_connection, nil
+          if connection.transaction_open?
+            connection.rollback_transaction
+          else
+            # Something committed or rolled back the transaction
+            clean = false
+            connection.reset!
+          end
+          connection.lock_thread = nil
+          checkin(connection)
+        end
+
+        clean
+      end
+
+      def connection_class # :nodoc:
+        pool_config.connection_class
       end
 
       # Returns true if there is an open connection being used for the current thread.
@@ -435,7 +351,7 @@ module ActiveRecord
       # #connection or #with_connection methods. Connections obtained through
       # #checkout will not be detected by #active_connection?
       def active_connection?
-        @thread_cached_conns[connection_cache_key(current_thread)]
+        connection_lease.connection
       end
 
       # Signal that the thread is finished with the current connection.
@@ -445,29 +361,39 @@ module ActiveRecord
       # This method only works for connections that have been obtained through
       # #connection or #with_connection methods, connections obtained through
       # #checkout will not be automatically released.
-      def release_connection(owner_thread = Thread.current)
-        if conn = @thread_cached_conns.delete(connection_cache_key(owner_thread))
+      def release_connection(existing_lease = nil)
+        if conn = connection_lease.release
           checkin conn
+          return true
         end
+        false
       end
 
-      # If a connection obtained through #connection or #with_connection methods
-      # already exists yield it to the block. If no such connection
-      # exists checkout a connection, yield it to the block, and checkin the
-      # connection when finished.
+      # Yields a connection from the connection pool to the block. If no connection
+      # is already checked out by the current thread, a connection will be checked
+      # out from the pool, yielded to the block, and then returned to the pool when
+      # the block is finished. If a connection has already been checked out on the
+      # current thread, such as via #connection or #with_connection, that existing
+      # connection will be the one yielded and it will not be returned to the pool
+      # automatically at the end of the block; it is expected that such an existing
+      # connection will be properly returned to the pool by the code that checked
+      # it out.
       def with_connection
-        unless conn = @thread_cached_conns[connection_cache_key(Thread.current)]
-          conn = connection
-          fresh_connection = true
+        lease = connection_lease
+        if lease.connection
+          yield lease.connection
+        else
+          begin
+            yield lease.connection = checkout
+          ensure
+            release_connection(lease) unless lease.sticky
+          end
         end
-        yield conn
-      ensure
-        release_connection if fresh_connection
       end
 
       # Returns true if a connection has already been opened.
       def connected?
-        synchronize { @connections.any? }
+        synchronize { @connections.any?(&:connected?) }
       end
 
       # Returns an array containing the connections currently in the pool.
@@ -490,7 +416,7 @@ module ActiveRecord
       # Raises:
       # - ActiveRecord::ExclusiveConnectionTimeoutError if unable to gain ownership of all
       #   connections in the pool within a timeout interval (default duration is
-      #   <tt>spec.config[:checkout_timeout] * 2</tt> seconds).
+      #   <tt>spec.db_config.checkout_timeout * 2</tt> seconds).
       def disconnect(raise_on_acquisition_timeout = true)
         with_exclusively_acquired_all_connections(raise_on_acquisition_timeout) do
           synchronize do
@@ -502,6 +428,7 @@ module ActiveRecord
               conn.disconnect!
             end
             @connections = []
+            @leases.clear
             @available.clear
           end
         end
@@ -511,7 +438,7 @@ module ActiveRecord
       #
       # The pool first tries to gain ownership of all connections. If unable to
       # do so within a timeout interval (default duration is
-      # <tt>spec.config[:checkout_timeout] * 2</tt> seconds), then the pool is forcefully
+      # <tt>spec.db_config.checkout_timeout * 2</tt> seconds), then the pool is forcefully
       # disconnected without any regard for other connection owning threads.
       def disconnect!
         disconnect(false)
@@ -524,12 +451,16 @@ module ActiveRecord
       # See AbstractAdapter#discard!
       def discard! # :nodoc:
         synchronize do
-          return if @connections.nil? # already discarded
+          return if self.discarded?
           @connections.each do |conn|
             conn.discard!
           end
-          @connections = @available = @thread_cached_conns = nil
+          @connections = @available = @leases = nil
         end
+      end
+
+      def discarded? # :nodoc:
+        @connections.nil?
       end
 
       # Clears the cache which maps classes and re-connects connections that
@@ -538,7 +469,7 @@ module ActiveRecord
       # Raises:
       # - ActiveRecord::ExclusiveConnectionTimeoutError if unable to gain ownership of all
       #   connections in the pool within a timeout interval (default duration is
-      #   <tt>spec.config[:checkout_timeout] * 2</tt> seconds).
+      #   <tt>spec.db_config.checkout_timeout * 2</tt> seconds).
       def clear_reloadable_connections(raise_on_acquisition_timeout = true)
         with_exclusively_acquired_all_connections(raise_on_acquisition_timeout) do
           synchronize do
@@ -560,7 +491,7 @@ module ActiveRecord
       #
       # The pool first tries to gain ownership of all connections. If unable to
       # do so within a timeout interval (default duration is
-      # <tt>spec.config[:checkout_timeout] * 2</tt> seconds), then the pool forcefully
+      # <tt>spec.db_config.checkout_timeout * 2</tt> seconds), then the pool forcefully
       # clears the cache and reloads connections without any regard for other
       # connection owning threads.
       def clear_reloadable_connections!
@@ -582,7 +513,19 @@ module ActiveRecord
       # Raises:
       # - ActiveRecord::ConnectionTimeoutError no connection can be obtained from the pool.
       def checkout(checkout_timeout = @checkout_timeout)
-        checkout_and_verify(acquire_connection(checkout_timeout))
+        if @pinned_connection
+          synchronize do
+            @pinned_connection.verify!
+            # Any leased connection must be in @connections otherwise
+            # some methods like #connected? won't behave correctly
+            unless @connections.include?(@pinned_connection)
+              @connections << @pinned_connection
+            end
+          end
+          @pinned_connection
+        else
+          checkout_and_verify(acquire_connection(checkout_timeout))
+        end
       end
 
       # Check-in a database connection back into the pool, indicating that you
@@ -591,9 +534,11 @@ module ActiveRecord
       # +conn+: an AbstractAdapter object, which was obtained by earlier by
       # calling #checkout on this pool.
       def checkin(conn)
+        return if @pinned_connection.equal?(conn)
+
         conn.lock.synchronize do
           synchronize do
-            remove_connection_from_thread_cache conn
+            connection_lease.clear(conn)
 
             conn._run_checkin_callbacks do
               conn.expire
@@ -640,6 +585,7 @@ module ActiveRecord
       # or a thread dies unexpectedly.
       def reap
         stale_connections = synchronize do
+          return if self.discarded?
           @connections.select do |conn|
             conn.in_use? && !conn.owner.alive?
           end.each do |conn|
@@ -655,6 +601,8 @@ module ActiveRecord
             remove conn
           end
         end
+
+        prune_thread_cache
       end
 
       # Disconnect all connections that have been idle for at least
@@ -664,6 +612,7 @@ module ActiveRecord
         return if minimum_idle.nil?
 
         idle_connections = synchronize do
+          return if self.discarded?
           @connections.select do |conn|
             !conn.in_use? && conn.seconds_idle >= minimum_idle
           end.each do |conn|
@@ -690,8 +639,7 @@ module ActiveRecord
         @available.num_waiting
       end
 
-      # Return connection pool's usage statistic
-      # Example:
+      # Returns the connection pool's usage statistic.
       #
       #    ActiveRecord::Base.connection_pool.stat # => { size: 15, connections: 1, busy: 1, dead: 0, idle: 0, waiting: 0, checkout_timeout: 5 }
       def stat
@@ -708,7 +656,32 @@ module ActiveRecord
         end
       end
 
+      def schedule_query(future_result) # :nodoc:
+        @async_executor.post { future_result.execute_or_skip }
+        Thread.pass
+      end
+
       private
+        def connection_lease
+          @leases[ActiveSupport::IsolatedExecutionState.context]
+        end
+
+        def build_async_executor
+          case ActiveRecord.async_query_executor
+          when :multi_thread_pool
+            if @db_config.max_threads > 0
+              Concurrent::ThreadPoolExecutor.new(
+                min_threads: @db_config.min_threads,
+                max_threads: @db_config.max_threads,
+                max_queue: @db_config.max_queue,
+                fallback_policy: :caller_runs
+              )
+            end
+          when :global_thread_pool
+            ActiveRecord.global_thread_pool_async_query_executor
+          end
+        end
+
         #--
         # this is unfortunately not concurrent
         def bulk_make_new_connections(num_new_conns_needed)
@@ -719,19 +692,6 @@ module ActiveRecord
               checkin(new_conn)
             end
           end
-        end
-
-        #--
-        # From the discussion on GitHub:
-        #  https://github.com/rails/rails/pull/14938#commitcomment-6601951
-        # This hook-in method allows for easier monkey-patching fixes needed by
-        # JRuby users that use Fibers.
-        def connection_cache_key(thread)
-          thread
-        end
-
-        def current_thread
-          @lock_thread || Thread.current
         end
 
         # Take control of all existing connections so a "group" action such as
@@ -747,18 +707,21 @@ module ActiveRecord
 
         def attempt_to_checkout_all_existing_connections(raise_on_acquisition_timeout = true)
           collected_conns = synchronize do
+            reap # No need to wait for dead owners
+
             # account for our own connections
-            @connections.select { |conn| conn.owner == Thread.current }
+            @connections.select { |conn| conn.owner == ActiveSupport::IsolatedExecutionState.context }
           end
 
           newly_checked_out = []
-          timeout_time      = Concurrent.monotonic_time + (@checkout_timeout * 2)
+          timeout_time      = Process.clock_gettime(Process::CLOCK_MONOTONIC) + (@checkout_timeout * 2)
 
-          @available.with_a_bias_for(Thread.current) do
+          @available.with_a_bias_for(ActiveSupport::IsolatedExecutionState.context) do
             loop do
               synchronize do
                 return if collected_conns.size == @connections.size && @now_connecting == 0
-                remaining_timeout = timeout_time - Concurrent.monotonic_time
+
+                remaining_timeout = timeout_time - Process.clock_gettime(Process::CLOCK_MONOTONIC)
                 remaining_timeout = 0 if remaining_timeout < 0
                 conn = checkout_for_exclusive_access(remaining_timeout)
                 collected_conns   << conn
@@ -801,14 +764,14 @@ module ActiveRecord
 
           thread_report = []
           @connections.each do |conn|
-            unless conn.owner == Thread.current
+            unless conn.owner == ActiveSupport::IsolatedExecutionState.context
               thread_report << "#{conn} is owned by #{conn.owner}"
             end
           end
 
           msg << " (#{thread_report.join(', ')})" if thread_report.any?
 
-          raise ExclusiveConnectionTimeoutError, msg
+          raise ExclusiveConnectionTimeoutError.new(msg, connection_pool: self)
         end
 
         def with_new_connections_blocked
@@ -862,21 +825,31 @@ module ActiveRecord
             conn
           else
             reap
-            @available.poll(checkout_timeout)
+            # Retry after reaping, which may return an available connection,
+            # remove an inactive connection, or both
+            if conn = @available.poll || try_to_checkout_new_connection
+              conn
+            else
+              @available.poll(checkout_timeout)
+            end
           end
+        rescue ConnectionTimeoutError => ex
+          raise ex.set_pool(self)
         end
 
         #--
         # if owner_thread param is omitted, this must be called in synchronize block
         def remove_connection_from_thread_cache(conn, owner_thread = conn.owner)
-          @thread_cached_conns.delete_pair(connection_cache_key(owner_thread), conn)
+          @leases[owner_thread].clear(conn)
         end
         alias_method :release, :remove_connection_from_thread_cache
 
         def new_connection
-          Base.send(spec.adapter_method, spec.config).tap do |conn|
-            conn.check_version
-          end
+          connection = db_config.new_connection
+          connection.pool = self
+          connection
+        rescue ConnectionNotEstablished => ex
+          raise ex.set_pool(self)
         end
 
         # If the pool is not at a <tt>@size</tt> limit, establish new connection. Connecting
@@ -914,6 +887,12 @@ module ActiveRecord
         def adopt_connection(conn)
           conn.pool = self
           @connections << conn
+
+          # We just created the first connection, it's time to load the schema
+          # cache if that wasn't eagerly done before
+          if @schema_cache.nil? && ActiveRecord.lazily_load_schema_cache
+            schema_cache.load!
+          end
         end
 
         def checkout_new_connection
@@ -923,234 +902,13 @@ module ActiveRecord
 
         def checkout_and_verify(c)
           c._run_checkout_callbacks do
-            c.verify!
+            c.clean!
           end
           c
-        rescue
+        rescue Exception
           remove c
           c.disconnect!
           raise
-        end
-    end
-
-    # ConnectionHandler is a collection of ConnectionPool objects. It is used
-    # for keeping separate connection pools that connect to different databases.
-    #
-    # For example, suppose that you have 5 models, with the following hierarchy:
-    #
-    #   class Author < ActiveRecord::Base
-    #   end
-    #
-    #   class BankAccount < ActiveRecord::Base
-    #   end
-    #
-    #   class Book < ActiveRecord::Base
-    #     establish_connection :library_db
-    #   end
-    #
-    #   class ScaryBook < Book
-    #   end
-    #
-    #   class GoodBook < Book
-    #   end
-    #
-    # And a database.yml that looked like this:
-    #
-    #   development:
-    #     database: my_application
-    #     host: localhost
-    #
-    #   library_db:
-    #     database: library
-    #     host: some.library.org
-    #
-    # Your primary database in the development environment is "my_application"
-    # but the Book model connects to a separate database called "library_db"
-    # (this can even be a database on a different machine).
-    #
-    # Book, ScaryBook and GoodBook will all use the same connection pool to
-    # "library_db" while Author, BankAccount, and any other models you create
-    # will use the default connection pool to "my_application".
-    #
-    # The various connection pools are managed by a single instance of
-    # ConnectionHandler accessible via ActiveRecord::Base.connection_handler.
-    # All Active Record models use this handler to determine the connection pool that they
-    # should use.
-    #
-    # The ConnectionHandler class is not coupled with the Active models, as it has no knowledge
-    # about the model. The model needs to pass a specification name to the handler,
-    # in order to look up the correct connection pool.
-    class ConnectionHandler
-      def self.create_owner_to_pool # :nodoc:
-        Concurrent::Map.new(initial_capacity: 2) do |h, k|
-          # Discard the parent's connection pools immediately; we have no need
-          # of them
-          discard_unowned_pools(h)
-
-          h[k] = Concurrent::Map.new(initial_capacity: 2)
-        end
-      end
-
-      def self.unowned_pool_finalizer(pid_map) # :nodoc:
-        lambda do |_|
-          discard_unowned_pools(pid_map)
-        end
-      end
-
-      def self.discard_unowned_pools(pid_map) # :nodoc:
-        pid_map.each do |pid, pools|
-          pools.values.compact.each(&:discard!) unless pid == Process.pid
-        end
-      end
-
-      attr_reader :prevent_writes
-
-      def initialize
-        # These caches are keyed by spec.name (ConnectionSpecification#name).
-        @owner_to_pool = ConnectionHandler.create_owner_to_pool
-        @prevent_writes = false
-
-        # Backup finalizer: if the forked child never needed a pool, the above
-        # early discard has not occurred
-        ObjectSpace.define_finalizer self, ConnectionHandler.unowned_pool_finalizer(@owner_to_pool)
-      end
-
-      # Prevent writing to the database regardless of role.
-      #
-      # In some cases you may want to prevent writes to the database
-      # even if you are on a database that can write. `while_preventing_writes`
-      # will prevent writes to the database for the duration of the block.
-      def while_preventing_writes
-        original, @prevent_writes = @prevent_writes, true
-        yield
-      ensure
-        @prevent_writes = original
-      end
-
-      def connection_pool_list
-        owner_to_pool.values.compact
-      end
-      alias :connection_pools :connection_pool_list
-
-      def establish_connection(config)
-        resolver = ConnectionSpecification::Resolver.new(Base.configurations)
-        spec = resolver.spec(config)
-
-        remove_connection(spec.name)
-
-        message_bus = ActiveSupport::Notifications.instrumenter
-        payload = {
-          connection_id: object_id
-        }
-        if spec
-          payload[:spec_name] = spec.name
-          payload[:config] = spec.config
-        end
-
-        message_bus.instrument("!connection.active_record", payload) do
-          owner_to_pool[spec.name] = ConnectionAdapters::ConnectionPool.new(spec)
-        end
-
-        owner_to_pool[spec.name]
-      end
-
-      # Returns true if there are any active connections among the connection
-      # pools that the ConnectionHandler is managing.
-      def active_connections?
-        connection_pool_list.any?(&:active_connection?)
-      end
-
-      # Returns any connections in use by the current thread back to the pool,
-      # and also returns connections to the pool cached by threads that are no
-      # longer alive.
-      def clear_active_connections!
-        connection_pool_list.each(&:release_connection)
-      end
-
-      # Clears the cache which maps classes.
-      #
-      # See ConnectionPool#clear_reloadable_connections! for details.
-      def clear_reloadable_connections!
-        connection_pool_list.each(&:clear_reloadable_connections!)
-      end
-
-      def clear_all_connections!
-        connection_pool_list.each(&:disconnect!)
-      end
-
-      # Disconnects all currently idle connections.
-      #
-      # See ConnectionPool#flush! for details.
-      def flush_idle_connections!
-        connection_pool_list.each(&:flush!)
-      end
-
-      # Locate the connection of the nearest super class. This can be an
-      # active or defined connection: if it is the latter, it will be
-      # opened and set as the active connection for the class it was defined
-      # for (not necessarily the current class).
-      def retrieve_connection(spec_name) #:nodoc:
-        pool = retrieve_connection_pool(spec_name)
-
-        unless pool
-          # multiple database application
-          if ActiveRecord::Base.connection_handler != ActiveRecord::Base.default_connection_handler
-            raise ConnectionNotEstablished, "No connection pool with '#{spec_name}' found for the '#{ActiveRecord::Base.current_role}' role."
-          else
-            raise ConnectionNotEstablished, "No connection pool with '#{spec_name}' found."
-          end
-        end
-
-        pool.connection
-      end
-
-      # Returns true if a connection that's accessible to this class has
-      # already been opened.
-      def connected?(spec_name)
-        pool = retrieve_connection_pool(spec_name)
-        pool && pool.connected?
-      end
-
-      # Remove the connection for this class. This will close the active
-      # connection and the defined connection (if they exist). The result
-      # can be used as an argument for #establish_connection, for easily
-      # re-establishing the connection.
-      def remove_connection(spec_name)
-        if pool = owner_to_pool.delete(spec_name)
-          pool.automatic_reconnect = false
-          pool.disconnect!
-          pool.spec.config
-        end
-      end
-
-      # Retrieving the connection pool happens a lot, so we cache it in @owner_to_pool.
-      # This makes retrieving the connection pool O(1) once the process is warm.
-      # When a connection is established or removed, we invalidate the cache.
-      def retrieve_connection_pool(spec_name)
-        owner_to_pool.fetch(spec_name) do
-          # Check if a connection was previously established in an ancestor process,
-          # which may have been forked.
-          if ancestor_pool = pool_from_any_process_for(spec_name)
-            # A connection was established in an ancestor process that must have
-            # subsequently forked. We can't reuse the connection, but we can copy
-            # the specification and establish a new connection with it.
-            establish_connection(ancestor_pool.spec.to_hash).tap do |pool|
-              pool.schema_cache = ancestor_pool.schema_cache if ancestor_pool.schema_cache
-            end
-          else
-            owner_to_pool[spec_name] = nil
-          end
-        end
-      end
-
-      private
-        def owner_to_pool
-          @owner_to_pool[Process.pid]
-        end
-
-        def pool_from_any_process_for(spec_name)
-          owner_to_pool = @owner_to_pool.values.reverse.find { |v| v[spec_name] }
-          owner_to_pool && owner_to_pool[spec_name]
         end
     end
   end

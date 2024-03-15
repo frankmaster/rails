@@ -3,34 +3,38 @@
 module ActiveRecord
   module Tasks # :nodoc:
     class SQLiteDatabaseTasks # :nodoc:
-      delegate :connection, :establish_connection, to: ActiveRecord::Base
+      def self.using_database_configurations?
+        true
+      end
 
-      def initialize(configuration, root = ActiveRecord::Tasks::DatabaseTasks.root)
-        @configuration, @root = configuration, root
+      def initialize(db_config, root = ActiveRecord::Tasks::DatabaseTasks.root)
+        @db_config = db_config
+        @root = root
       end
 
       def create
-        raise DatabaseAlreadyExists if File.exist?(configuration["database"])
+        raise DatabaseAlreadyExists if File.exist?(db_config.database)
 
-        establish_connection configuration
+        establish_connection
         connection
       end
 
       def drop
-        require "pathname"
-        path = Pathname.new configuration["database"]
-        file = path.absolute? ? path.to_s : File.join(root, path)
-
+        db_path = db_config.database
+        file = File.absolute_path?(db_path) ? db_path : File.join(root, db_path)
         FileUtils.rm(file)
+        FileUtils.rm_f(["#{file}-shm", "#{file}-wal"])
       rescue Errno::ENOENT => error
         raise NoDatabaseError.new(error.message)
       end
 
       def purge
+        connection.disconnect!
         drop
       rescue NoDatabaseError
       ensure
         create
+        connection.reconnect!
       end
 
       def charset
@@ -40,10 +44,11 @@ module ActiveRecord
       def structure_dump(filename, extra_flags)
         args = []
         args.concat(Array(extra_flags)) if extra_flags
-        args << configuration["database"]
+        args << db_config.database
 
         ignore_tables = ActiveRecord::SchemaDumper.ignore_tables
         if ignore_tables.any?
+          ignore_tables = connection.data_sources.select { |table| ignore_tables.any? { |pattern| pattern === table } }
           condition = ignore_tables.map { |table| connection.quote(table) }.join(", ")
           args << "SELECT sql FROM sqlite_master WHERE tbl_name NOT IN (#{condition}) ORDER BY tbl_name, type DESC, name"
         else
@@ -53,13 +58,21 @@ module ActiveRecord
       end
 
       def structure_load(filename, extra_flags)
-        dbfile = configuration["database"]
         flags = extra_flags.join(" ") if extra_flags
-        `sqlite3 #{flags} #{dbfile} < "#{filename}"`
+        `sqlite3 #{flags} #{db_config.database} < "#{filename}"`
       end
 
       private
-        attr_reader :configuration, :root
+        attr_reader :db_config, :root
+
+        def connection
+          ActiveRecord::Base.lease_connection
+        end
+
+        def establish_connection(config = db_config)
+          ActiveRecord::Base.establish_connection(config)
+          connection.connect!
+        end
 
         def run_cmd(cmd, args, out)
           fail run_cmd_error(cmd, args) unless Kernel.system(cmd, *args, out: out)

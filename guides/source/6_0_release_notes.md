@@ -11,7 +11,7 @@ Highlights in Rails 6.0:
 * Action Cable Testing
 
 These release notes cover only the major changes. To learn about various bug
-fixes and changes, please refer to the change logs or check out the [list of
+fixes and changes, please refer to the changelogs or check out the [list of
 commits](https://github.com/rails/rails/commits/6-0-stable) in the main Rails
 repository on GitHub.
 
@@ -430,7 +430,7 @@ Please refer to the [Changelog][active-record] for detailed changes.
 *   Deprecate using class level querying methods if the receiver scope has leaked.
     ([Pull Request](https://github.com/rails/rails/pull/35280))
 
-*   Deprecate `config.activerecord.sqlite3.represent_boolean_as_integer`.
+*   Deprecate `config.active_record.sqlite3.represent_boolean_as_integer`.
     ([Commit](https://github.com/rails/rails/commit/f59b08119bc0c01a00561d38279b124abc82561b))
 
 *   Deprecate passing `migrations_paths` to `connection.assume_migrated_upto_version`.
@@ -1001,6 +1001,9 @@ Ruby on Rails Guides
 Please refer to the [Changelog][guides] for detailed changes.
 
 ### Notable changes
+
+*   Add Multiple Databases with Active Record guide.
+    ([Pull Request](https://github.com/rails/rails/pull/36389))
 
 *   Add a section about troubleshooting of autoloading constants.
     ([Commit](https://github.com/rails/rails/commit/c03bba4f1f03bad7dc034af555b7f2b329cf76f5))
